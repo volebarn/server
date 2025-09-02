@@ -10,6 +10,9 @@ impl Server {
     }
     
     pub async fn run(self) -> Result<()> {
-        Err(ServerError::Config("Not implemented".to_string()))
+        Err(ServerError::Config { 
+            field: "server".to_string(), 
+            error: "Not implemented".to_string() 
+        })
     }
 }

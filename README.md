@@ -103,3 +103,7 @@ The server uses a hybrid storage approach:
 - **DashMap**: Temporary request-scoped state (not persistent)
 
 Files are deduplicated using xxHash3 and stored in a balanced directory tree structure for optimal filesystem performance.
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).

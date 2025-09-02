@@ -7,7 +7,7 @@
   - Create storage directory structure for RocksDB metadata and file system content
   - _Requirements: 5.3, 5.4_
 
-- [ ] 2. Implement core data models and types
+- [x] 2. Implement core data models and types
   - Create shared types for FileMetadata, DirectoryListing, SyncPlan, and BulkOperation structs
   - Implement dual serialization: serde_json for API layer and bincode for RocksDB storage layer
   - Add xxhash-rust integration for file integrity verification and content-addressable storage
