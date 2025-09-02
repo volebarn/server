@@ -1,0 +1,29 @@
+[package]
+name = "volebarn-console"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+volebarn-client = { path = "../volebarn-client" }
+dashmap = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+xxhash-rust = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+notify = { workspace = true }
+uuid = { workspace = true }
+crossbeam = { workspace = true }
+
+# Additional dependencies for console app
+clap = { version = "4.4", features = ["derive"] }
+dirs = "5.0"
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }

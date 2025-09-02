@@ -1,16 +1,31 @@
+# Rust build artifacts
 /target/
-*.profraw
-*.profdata
-.rls/
-.rust-analyzer.json
-.DS_Store
-.AppleDouble
-.LSOverride
-# Icon must end with two \r
-Icon
-._*
-.Spotlight-V100
-.Trashes
-.DS_Store?
-.fseventsd
+**/target/
+Cargo.lock
+
+# Storage data (exclude actual stored files and database)
+/storage/metadata/*
+/storage/files/*
+/storage/temp/*
+!/storage/metadata/.gitkeep
+!/storage/files/.gitkeep
+!/storage/temp/.gitkeep
+
+# IDE and editor files
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Configuration files with secrets
+config.toml
+.env
