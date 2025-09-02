@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 
 /// File metadata with dual serialization support
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bincode::Encode, bincode::Decode)]
 pub struct FileMetadata {
     /// Full path including subdirectories
     pub path: String,

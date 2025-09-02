@@ -15,7 +15,7 @@
   - _Requirements: 3.4, 5.5, 1.18, 3.14_
 
 - [ ] 3. Implement server storage layer
-- [ ] 3.1 Create async RocksDB metadata storage system
+- [x] 3.1 Create async RocksDB metadata storage system
   - Implement MetadataStore struct with RocksDB for persistent metadata storage using bincode serialization
   - Set up column families for files, directories, hash index, and modified time index
   - Add async methods for CRUD operations on file metadata with atomic operations
@@ -23,7 +23,7 @@
   - Write unit tests for metadata storage operations with concurrent access scenarios
   - _Requirements: 1.2, 1.3, 1.4, 1.5, 1.7, 1.8_
 
-- [ ] 3.2 Create async file system storage layer
+- [x] 3.2 Create async file system storage layer
   - Implement FileStorage struct for content-addressable file storage on disk
   - Add async methods for storing and retrieving file content using hash-based paths with zero-copy Bytes
   - Implement atomic file operations using temp files and rename for consistency
