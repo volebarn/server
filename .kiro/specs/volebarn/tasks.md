@@ -83,7 +83,7 @@
 - [ ] 5.1 Create async bulk upload endpoint
   - Implement async POST /bulk/upload with multipart/form-data support using zero-copy Bytes
   - Add async zero-copy file processing for multiple files using RocksDB transactions and FileStorage
-  - Use Snappy compression for metadata serialization (651-2,225 MB/s pipeline performance)
+  - Use Snappy compression for metadata serialization 
   - Handle directory structure preservation during bulk uploads using RocksDB metadata operations with bitcode serialization
   - Use DashMap for temporary request-scoped progress tracking during bulk upload
   - Return BulkUploadResponse with success/failure details using atomic counters
@@ -116,8 +116,8 @@
   - Write async tests for TLS connectivity and concurrent connections
   - _Requirements: 1.19, 3.15_
 
-- [x] 7. Implement client library foundation
-- [x] 7.1 Create async HTTP client with TLS support and resilience
+- [ ] 7. Implement client library foundation
+- [ ] 7.1 Create async HTTP client with TLS support and resilience
   - Implement async Client struct with reqwest and TLS 1.3 configuration using atomic state
   - Add async connection pooling and timeout configuration with lock-free management
   - Implement comprehensive retry logic with exponential backoff, jitter, and circuit breaker pattern
@@ -134,17 +134,19 @@
   - _Requirements: 3.14, 2.13_
 
 - [ ] 8. Implement client library file operations
-- [x] 8.1 Create async single file operation methods
+- [ ] 8.1 Create async single file operation methods
   - Implement async upload_file, download_file, update_file, delete_file methods using zero-copy Bytes
   - Add async get_file_metadata, move_file, copy_file methods with lock-free operations
   - Include async hash verification in all file transfer operations with atomic checks
+  - Handle Snappy compression with Bitcode serialization for metadata responses 
   - Write async unit tests with mock server for all single file operations without locks
   - _Requirements: 3.1, 3.11, 3.12, 3.14_
 
-- [x] 8.2 Create async directory operation methods
+- [ ] 8.2 Create async directory operation methods
   - Implement async create_directory, delete_directory, list_directory methods using lock-free patterns
   - Add async search_files method with concurrent pattern matching and atomic result collection
   - Include proper async error handling for directory operations using atomic error tracking
+  - Handle Snappy compression with Bitcode serialization for directory listing
   - Write async unit tests for directory operations with zero-lock concurrent access
   - _Requirements: 3.1, 3.13_
 
@@ -160,7 +162,7 @@
   - Create async get_manifest method for retrieving server file manifest using zero-copy with Snappy decompression
   - Implement async sync method that compares local vs remote using lock-free operations with bitcode deserialization
   - Add async methods for downloading missing files and deleting extra local files with atomic progress tracking
-  - Use Snappy compression for manifest transfer (651-2,225 MB/s pipeline performance)
+  - Use Snappy compression with Bitcode serialization for manifest transfer 
   - Create high-level async full_sync method that makes local directory match server using lock-free patterns
   - Write comprehensive async tests for sync scenarios with zero-lock concurrent operations
   - _Requirements: 3.7, 3.8, 3.9_
@@ -186,7 +188,7 @@
 - [ ] 11.1 Create async local file index with optional persistence
   - Implement async FileIndex using DashMap for tracking entire directory tree state lock-free
   - Add optional local RocksDB for persisting client-side file index across restarts using bitcode serialization
-  - Use Snappy compression for local index persistence (651-2,225 MB/s pipeline performance)
+  - Use Snappy compression for local index persistence 
   - Add async hash calculation and change detection for all files using xxhash-rust
   - Create async index initialization from existing directory structure
   - Implement atomic index updates based on file system events using DashMap operations
