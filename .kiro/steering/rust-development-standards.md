@@ -67,6 +67,18 @@
 - **uuid** - UUID generation for temporary files
 - **tokio-util** - Additional Tokio utilities
 
+## Server Testing Guidelines
+
+- **Background execution**: When testing server while running, use `cargo run &` to run in background
+- **Default startup output**: Server must output startup information with default settings including:
+  - Server name and version
+  - Listening address and port (default: 127.0.0.1:8080)
+  - Available endpoints
+  - Storage location
+- **Health check**: Server should provide `/health` endpoint for testing connectivity
+- **Graceful shutdown**: Server should handle SIGTERM/SIGINT for clean shutdown
+- **Test isolation**: Use temporary directories for test storage to avoid conflicts
+
 ## Forbidden Patterns
 
 - **Arc<Mutex<T>>** - Use DashMap or atomic types instead

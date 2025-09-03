@@ -1,32 +1,60 @@
-//! HTTP request handlers for single file operations
+//! HTTP request handlers for single file operations and bulk operations
 //! 
-//! This module implements async handlers for all single file operations:
+//! This module implements async handlers for all file operations:
 //! - POST /files/*path - Upload files with RocksDB metadata and file system storage
 //! - GET /files/*path - Download files with zero-copy Bytes streaming
 //! - PUT /files/*path - Update files atomically using temp files
 //! - DELETE /files/*path - Delete files from both RocksDB and file system
 //! - HEAD /files/*path - Get file metadata from RocksDB
+//! - POST /bulk/upload - Bulk upload multiple files with multipart/form-data
 
 use crate::error::{ServerError, ServerResult};
 use crate::storage::{FileStorage, MetadataStore};
-use crate::types::{FileMetadataResponse, DirectoryListing};
+use crate::types::{FileMetadataResponse, DirectoryListing, BulkUploadResponse, OperationError, ErrorCode, FileUpload};
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
+use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::{debug, info, warn};
+use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use tracing::{debug, info, warn, error};
+
+/// Progress tracking for bulk upload operations
+#[derive(Debug)]
+pub struct BulkUploadProgress {
+    pub total_files: AtomicUsize,
+    pub processed_files: AtomicUsize,
+    pub successful_files: AtomicUsize,
+    pub failed_files: AtomicUsize,
+    pub total_bytes: AtomicU64,
+    pub processed_bytes: AtomicU64,
+}
+
+impl BulkUploadProgress {
+    pub fn new() -> Self {
+        Self {
+            total_files: AtomicUsize::new(0),
+            processed_files: AtomicUsize::new(0),
+            successful_files: AtomicUsize::new(0),
+            failed_files: AtomicUsize::new(0),
+            total_bytes: AtomicU64::new(0),
+            processed_bytes: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Shared application state containing storage components
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub metadata_store: Arc<MetadataStore>,
     pub file_storage: Arc<FileStorage>,
+    /// Request-scoped progress tracking for bulk operations
+    pub bulk_progress: Arc<DashMap<String, Arc<BulkUploadProgress>>>,
 }
 
 impl AppState {
@@ -41,6 +69,7 @@ impl AppState {
         Ok(Self {
             metadata_store,
             file_storage,
+            bulk_progress: Arc::new(DashMap::new()),
         })
     }
 }
@@ -463,6 +492,268 @@ pub async fn get_file_or_directory(
         // Path doesn't exist, return 404
         Err(ServerError::FileNotFound { path })
     }
+}
+
+/// Bulk upload multiple files using multipart/form-data
+/// POST /bulk/upload
+pub async fn bulk_upload(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> ServerResult<Response> {
+    use uuid::Uuid;
+    
+    let request_id = Uuid::new_v4().to_string();
+    debug!("Starting bulk upload with request ID: {}", request_id);
+    
+    // Create progress tracker for this request
+    let progress = Arc::new(BulkUploadProgress::new());
+    state.bulk_progress.insert(request_id.clone(), progress.clone());
+    
+    // Collect all files from multipart data
+    let mut files_to_upload = Vec::new();
+    let mut total_size = 0u64;
+    
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        ServerError::MultipartParsing {
+            error: format!("Failed to get next field: {}", e),
+        }
+    })? {
+        let field_name = field.name().unwrap_or("unknown").to_string();
+        let file_name = field.file_name().map(|s| s.to_string());
+        
+        debug!("Processing multipart field: {} (filename: {:?})", field_name, file_name);
+        
+        // Get file content as bytes
+        let content = field.bytes().await.map_err(|e| {
+            ServerError::MultipartParsing {
+                error: format!("Failed to read field content: {}", e),
+            }
+        })?;
+        
+        // Determine file path - use field name as the full path, removing "files/" prefix
+        let file_path = if field_name.starts_with("files/") {
+            field_name[6..].to_string() // Remove "files/" prefix
+        } else if field_name == "files" {
+            // If field name is just "files", use the filename
+            file_name.unwrap_or("unknown".to_string())
+        } else {
+            // Use field name as-is
+            field_name
+        };
+        
+        // Skip empty files or invalid paths
+        if content.is_empty() || file_path.is_empty() {
+            warn!("Skipping empty file or invalid path: {}", file_path);
+            continue;
+        }
+        
+        total_size += content.len() as u64;
+        files_to_upload.push(FileUpload {
+            path: file_path,
+            content,
+        });
+    }
+    
+    if files_to_upload.is_empty() {
+        // Clean up progress tracker
+        state.bulk_progress.remove(&request_id);
+        return Err(ServerError::InvalidPath {
+            path: "multipart".to_string(),
+            reason: "No valid files found in multipart data".to_string(),
+        });
+    }
+    
+    // Update progress with totals
+    progress.total_files.store(files_to_upload.len(), Ordering::Relaxed);
+    progress.total_bytes.store(total_size, Ordering::Relaxed);
+    
+    info!("Bulk upload: {} files, {} bytes total", files_to_upload.len(), total_size);
+    
+    // Process files concurrently but with controlled parallelism
+    let mut success_paths = Vec::new();
+    let mut failed_operations = Vec::new();
+    
+    // Use futures for concurrent processing with limited concurrency
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::pin::Pin;
+    use std::future::Future;
+    
+    type UploadFuture = Pin<Box<dyn Future<Output = Result<String, OperationError>> + Send>>;
+    let mut upload_futures: FuturesUnordered<UploadFuture> = FuturesUnordered::new();
+    const MAX_CONCURRENT_UPLOADS: usize = 10; // Limit concurrent uploads
+    
+    let mut file_iter = files_to_upload.into_iter();
+    
+    // Start initial batch of uploads
+    for _ in 0..MAX_CONCURRENT_UPLOADS {
+        if let Some(file_upload) = file_iter.next() {
+            let state_clone = state.clone();
+            let progress_clone = progress.clone();
+            
+            let future: UploadFuture = Box::pin(async move {
+                process_single_upload(state_clone, file_upload, progress_clone).await
+            });
+            upload_futures.push(future);
+        }
+    }
+    
+    // Process uploads as they complete and start new ones
+    while let Some(result) = upload_futures.next().await {
+        match result {
+            Ok(path) => {
+                success_paths.push(path);
+                progress.successful_files.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                failed_operations.push(error);
+                progress.failed_files.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        
+        progress.processed_files.fetch_add(1, Ordering::Relaxed);
+        
+        // Start next upload if available
+        if let Some(file_upload) = file_iter.next() {
+            let state_clone = state.clone();
+            let progress_clone = progress.clone();
+            
+            let future: UploadFuture = Box::pin(async move {
+                process_single_upload(state_clone, file_upload, progress_clone).await
+            });
+            upload_futures.push(future);
+        }
+    }
+    
+    // Clean up progress tracker
+    state.bulk_progress.remove(&request_id);
+    
+    let response = BulkUploadResponse {
+        success: success_paths,
+        failed: failed_operations,
+    };
+    
+    info!(
+        "Bulk upload completed: {} successful, {} failed",
+        response.success.len(),
+        response.failed.len()
+    );
+    
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Process a single file upload within a bulk operation
+async fn process_single_upload(
+    state: AppState,
+    file_upload: FileUpload,
+    progress: Arc<BulkUploadProgress>,
+) -> Result<String, OperationError> {
+    let path = file_upload.path.clone();
+    let content_size = file_upload.content.len() as u64;
+    
+    debug!("Processing upload for: {} ({} bytes)", path, content_size);
+    
+    // Check if file already exists
+    if let Ok(Some(_existing)) = state.metadata_store.get_file_metadata(&path).await {
+        return Err(OperationError {
+            path: path.clone(),
+            error: "File already exists".to_string(),
+            error_code: ErrorCode::ServerError, // Using ServerError for conflict
+        });
+    }
+    
+    // Ensure parent directories exist
+    if let Some(parent_path) = get_parent_directory(&path) {
+        if let Err(e) = ensure_parent_directories_exist(&state, &parent_path).await {
+            return Err(OperationError {
+                path: path.clone(),
+                error: format!("Failed to create parent directories: {}", e),
+                error_code: ErrorCode::StorageError,
+            });
+        }
+    }
+    
+    // Store file using FileStorage
+    match state.file_storage.store_file(&path, file_upload.content).await {
+        Ok(_metadata) => {
+            progress.processed_bytes.fetch_add(content_size, Ordering::Relaxed);
+            debug!("Successfully uploaded: {}", path);
+            Ok(path)
+        }
+        Err(e) => {
+            error!("Failed to upload {}: {}", path, e);
+            Err(OperationError {
+                path: path.clone(),
+                error: e.to_string(),
+                error_code: e.error_code(),
+            })
+        }
+    }
+}
+
+/// Extract parent directory path from a file path
+fn get_parent_directory(path: &str) -> Option<String> {
+    let path_obj = std::path::Path::new(path);
+    path_obj.parent().and_then(|p| {
+        let parent_str = p.to_string_lossy();
+        if parent_str.is_empty() || parent_str == "." {
+            None
+        } else {
+            Some(parent_str.to_string())
+        }
+    })
+}
+
+/// Ensure all parent directories exist, creating them if necessary
+async fn ensure_parent_directories_exist(
+    state: &AppState,
+    parent_path: &str,
+) -> ServerResult<()> {
+    let normalized_path = if parent_path.starts_with('/') {
+        parent_path.to_string()
+    } else {
+        format!("/{}", parent_path)
+    };
+    
+    // Check if directory already exists
+    if let Ok(Some(metadata)) = state.metadata_store.get_file_metadata(&normalized_path).await {
+        if metadata.is_directory {
+            return Ok(()); // Directory already exists
+        } else {
+            return Err(ServerError::InvalidPath {
+                path: normalized_path,
+                reason: "Path exists but is not a directory".to_string(),
+            });
+        }
+    }
+    
+    // Create parent directories recursively
+    let path_parts: Vec<&str> = normalized_path.trim_start_matches('/').split('/').collect();
+    let mut current_path = String::new();
+    
+    for part in path_parts {
+        if part.is_empty() {
+            continue;
+        }
+        
+        current_path.push('/');
+        current_path.push_str(part);
+        
+        // Check if this directory level exists
+        if let Ok(Some(metadata)) = state.metadata_store.get_file_metadata(&current_path).await {
+            if !metadata.is_directory {
+                return Err(ServerError::InvalidPath {
+                    path: current_path,
+                    reason: "Path exists but is not a directory".to_string(),
+                });
+            }
+        } else {
+            // Create this directory level
+            state.metadata_store.create_directory(&current_path).await?;
+            debug!("Created directory: {}", current_path);
+        }
+    }
+    
+    Ok(())
 }
 
 /// Simple glob-style pattern matching

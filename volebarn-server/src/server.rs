@@ -4,7 +4,7 @@
 //! configurable binding, error handling middleware, and health checks.
 
 use crate::{Result, ServerError};
-use crate::handlers::{AppState, upload_file, update_file, delete_file, get_file_metadata, list_directory, create_directory, delete_directory, search_files, get_file_or_directory};
+use crate::handlers::{AppState, upload_file, update_file, delete_file, get_file_metadata, list_directory, create_directory, delete_directory, search_files, get_file_or_directory, bulk_upload};
 use axum::{
     extract::MatchedPath,
     http::{Request, StatusCode},
@@ -127,7 +127,7 @@ impl Server {
     }
     
     /// Create the Axum application with routing and middleware
-    fn create_app(app_state: AppState) -> Router {
+    pub fn create_app(app_state: AppState) -> Router {
         Router::new()
             // Health check endpoint
             .route("/health", get(health_check))
@@ -144,6 +144,8 @@ impl Server {
             // Directory operation endpoints
             .route("/directories/{*path}", post(create_directory))
             .route("/directories/{*path}", delete(delete_directory))
+            // Bulk operation endpoints
+            .route("/bulk/upload", post(bulk_upload))
             // Search endpoint
             .route("/search", get(search_files))
             // Add application state
@@ -213,7 +215,8 @@ async fn root_handler() -> impl IntoResponse {
             "health": "/health",
             "files": "/files/*path",
             "directories": "/directories/*path",
-            "bulk": "/bulk/*operation"
+            "bulk_upload": "/bulk/upload",
+            "search": "/search"
         }
     });
     

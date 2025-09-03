@@ -14,7 +14,7 @@
   - Create comprehensive custom error types using thiserror with detailed error codes and context
   - _Requirements: 3.4, 5.5, 1.18, 3.14_
 
-- [ ] 3. Implement server storage layer
+- [x] 3. Implement server storage layer
 - [x] 3.1 Create async RocksDB metadata storage system
   - Implement MetadataStore struct with RocksDB for persistent metadata storage using bincode serialization
   - Set up column families for files, directories, hash index, and modified time index
@@ -32,7 +32,7 @@
   - Write unit tests for file storage operations with concurrent access and deduplication
   - _Requirements: 1.18, 3.14, 1.2, 1.3, 1.4, 1.5_
 
-- [ ] 4. Implement basic server HTTP endpoints
+- [x] 4. Implement basic server HTTP endpoints
 - [x] 4.1 Create async Axum server foundation
   - Set up Axum application with routing structure using Tokio runtime
   - Implement server startup with configurable IP and port binding
@@ -58,7 +58,7 @@
   - _Requirements: 1.6, 1.7, 1.8, 1.17_
 
 - [ ] 5. Implement bulk operations on server
-- [ ] 5.1 Create async bulk upload endpoint
+- [x] 5.1 Create async bulk upload endpoint
   - Implement async POST /bulk/upload with multipart/form-data support using zero-copy Bytes
   - Add async zero-copy file processing for multiple files using RocksDB transactions and FileStorage
   - Handle directory structure preservation during bulk uploads using RocksDB metadata operations
