@@ -2,21 +2,37 @@
 //! 
 //! This module provides persistent metadata storage using RocksDB with lock-free operations.
 //! Features content-addressable file storage, atomic operations, and hierarchical directory support.
+//! Uses bitcode serialization with Snappy compression for optimal performance.
 
 use crate::error::{ServerError, ServerResult};
 use crate::hash::{hash_bytes, HashManager};
 use crate::types::FileMetadata;
-use crate::storage_types::StorageFileMetadata;
-use crate::serialization::{serialize_compressed, deserialize_compressed};
 use bytes::Bytes;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+
+/// Wrapper for SystemTime that supports bitcode serialization
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+struct BitcodeSystemTime(u64);
+
+impl From<SystemTime> for BitcodeSystemTime {
+    fn from(time: SystemTime) -> Self {
+        let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+        Self(duration.as_secs())
+    }
+}
+
+impl From<BitcodeSystemTime> for SystemTime {
+    fn from(time: BitcodeSystemTime) -> Self {
+        UNIX_EPOCH + std::time::Duration::from_secs(time.0)
+    }
+}
 
 /// Column family names for RocksDB
 const CF_FILES: &str = "files";
@@ -24,13 +40,80 @@ const CF_DIRECTORIES: &str = "directories";
 const CF_HASH_INDEX: &str = "hash_index";
 const CF_MODIFIED_INDEX: &str = "modified_index";
 
+/// Storage-specific FileMetadata with bitcode-compatible types
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+struct StorageFileMetadata {
+    path: String,
+    name: String,
+    size: u64,
+    modified: BitcodeSystemTime,
+    is_directory: bool,
+    xxhash3: u64,
+    storage_path: Option<String>,
+}
+
+impl From<FileMetadata> for StorageFileMetadata {
+    fn from(metadata: FileMetadata) -> Self {
+        Self {
+            path: metadata.path,
+            name: metadata.name,
+            size: metadata.size,
+            modified: metadata.modified.into(),
+            is_directory: metadata.is_directory,
+            xxhash3: metadata.xxhash3,
+            storage_path: metadata.storage_path,
+        }
+    }
+}
+
+impl From<StorageFileMetadata> for FileMetadata {
+    fn from(storage: StorageFileMetadata) -> Self {
+        Self {
+            path: storage.path,
+            name: storage.name,
+            size: storage.size,
+            modified: storage.modified.into(),
+            is_directory: storage.is_directory,
+            xxhash3: storage.xxhash3,
+            storage_path: storage.storage_path,
+        }
+    }
+}
+
+/// Serialize data using bitcode with Snappy compression
+fn serialize_compressed<T: bitcode::Encode>(data: &T) -> ServerResult<Vec<u8>> {
+    let encoded = bitcode::encode(data);
+    let compressed = snap::raw::Encoder::new()
+        .compress_vec(&encoded)
+        .map_err(|e| ServerError::Serialization {
+            operation: "snappy_compress".to_string(),
+            error: e.to_string(),
+        })?;
+    Ok(compressed)
+}
+
+/// Deserialize data using bitcode with Snappy decompression
+fn deserialize_compressed<T: for<'a> bitcode::Decode<'a>>(data: &[u8]) -> ServerResult<T> {
+    let decompressed = snap::raw::Decoder::new()
+        .decompress_vec(data)
+        .map_err(|e| ServerError::Deserialization {
+            operation: "snappy_decompress".to_string(),
+            error: e.to_string(),
+        })?;
+    
+    bitcode::decode(&decompressed).map_err(|e| ServerError::Deserialization {
+        operation: "bitcode_decode".to_string(),
+        error: e.to_string(),
+    })
+}
+
 /// Directory metadata for hierarchical support
 #[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 struct DirectoryMetadata {
     path: String,
     name: String,
-    created: crate::time_utils::SerializableSystemTime,
-    modified: crate::time_utils::SerializableSystemTime,
+    created: BitcodeSystemTime,
+    modified: BitcodeSystemTime,
     child_count: u64,
 }
 
@@ -136,12 +219,8 @@ impl MetadataStore {
 
         match result {
             Some(data) => {
-                let (metadata, _): (FileMetadata, usize) = bincode::decode_from_slice(&data, bincode::config::standard()).map_err(|e| {
-                    ServerError::Deserialization {
-                        operation: "file_metadata".to_string(),
-                        error: e.to_string(),
-                    }
-                })?;
+                let storage_metadata: StorageFileMetadata = deserialize_compressed(&data)?;
+                let metadata: FileMetadata = storage_metadata.into();
                 Ok(Some(metadata))
             }
             None => Ok(None),
@@ -159,11 +238,9 @@ impl MetadataStore {
         let mut normalized_metadata = metadata.clone();
         normalized_metadata.path = normalized_path.clone();
 
-        // Serialize metadata
-        let data = bincode::encode_to_vec(&normalized_metadata, bincode::config::standard()).map_err(|e| ServerError::Serialization {
-            operation: "file_metadata".to_string(),
-            error: e.to_string(),
-        })?;
+        // Convert to storage format and serialize using bitcode with Snappy compression
+        let storage_metadata: StorageFileMetadata = normalized_metadata.clone().into();
+        let data = serialize_compressed(&storage_metadata)?;
 
         // Create batch for atomic operations
         let mut batch = rocksdb::WriteBatch::default();
@@ -307,12 +384,8 @@ impl MetadataStore {
             
             // Check if this file is a direct child of the requested directory
             if self.is_direct_child(&normalized_path, &file_path) {
-                let (metadata, _): (FileMetadata, usize) = bincode::decode_from_slice(&value, bincode::config::standard()).map_err(|e| {
-                    ServerError::Deserialization {
-                        operation: "list_directory".to_string(),
-                        error: e.to_string(),
-                    }
-                })?;
+                let storage_metadata: StorageFileMetadata = deserialize_compressed(&value)?;
+                let metadata: FileMetadata = storage_metadata.into();
                 results.push(metadata);
             } else if !file_path.starts_with(&prefix) {
                 // We've moved beyond files in this directory
@@ -411,18 +484,13 @@ impl MetadataStore {
         let dir_metadata = DirectoryMetadata {
             path: normalized_path.clone(),
             name: metadata.name.clone(),
-            created: now,
-            modified: now,
+            created: now.into(),
+            modified: now.into(),
             child_count: 0,
         };
 
         let cf_dirs = self.cf_handle(CF_DIRECTORIES)?;
-        let data = bincode::encode_to_vec(&dir_metadata, bincode::config::standard()).map_err(|e| {
-            ServerError::Serialization {
-                operation: "directory_metadata".to_string(),
-                error: e.to_string(),
-            }
-        })?;
+        let data = serialize_compressed(&dir_metadata)?;
 
         self.db
             .put_cf(cf_dirs, normalized_path.as_bytes(), data)
@@ -547,12 +615,7 @@ impl MetadataStore {
         })?;
 
         if let Some(data) = current_data {
-            let (mut dir_metadata, _): (DirectoryMetadata, usize) = bincode::decode_from_slice(&data, bincode::config::standard()).map_err(|e| {
-                ServerError::Deserialization {
-                    operation: "directory_metadata".to_string(),
-                    error: e.to_string(),
-                }
-            })?;
+            let mut dir_metadata: DirectoryMetadata = deserialize_compressed(&data)?;
 
             // Update child count (ensure it doesn't go below 0)
             if delta < 0 && dir_metadata.child_count < (-delta) as u64 {
@@ -561,15 +624,10 @@ impl MetadataStore {
                 dir_metadata.child_count = (dir_metadata.child_count as i64 + delta).max(0) as u64;
             }
             
-            dir_metadata.modified = SystemTime::now();
+            dir_metadata.modified = SystemTime::now().into();
 
             // Save updated metadata
-            let updated_data = bincode::encode_to_vec(&dir_metadata, bincode::config::standard()).map_err(|e| {
-                ServerError::Serialization {
-                    operation: "directory_metadata".to_string(),
-                    error: e.to_string(),
-                }
-            })?;
+            let updated_data = serialize_compressed(&dir_metadata)?;
 
             self.db
                 .put_cf(cf_dirs, dir_path.as_bytes(), updated_data)
@@ -595,12 +653,8 @@ impl MetadataStore {
                 error: e.to_string(),
             })?;
             
-            let (metadata, _): (FileMetadata, usize) = bincode::decode_from_slice(&value, bincode::config::standard()).map_err(|e| {
-                ServerError::Deserialization {
-                    operation: "find_file_with_hash".to_string(),
-                    error: e.to_string(),
-                }
-            })?;
+            let storage_metadata: StorageFileMetadata = deserialize_compressed(&value)?;
+            let metadata: FileMetadata = storage_metadata.into();
             
             if !metadata.is_directory && metadata.xxhash3 == hash {
                 return Ok(Some(String::from_utf8_lossy(&key).to_string()));
@@ -828,17 +882,19 @@ impl FileStorage {
             }
         })?;
 
-        let bytes = Bytes::from(content);
-
-        // Verify integrity using hash
-        let actual_hash = hash_bytes(&bytes);
-        if !self.hash_manager.verify(metadata.xxhash3, actual_hash) {
+        // Verify integrity using hash before converting to Bytes
+        if !self.hash_manager.verify(&content, metadata.xxhash3) {
+            let actual_hash = hash_bytes(&Bytes::from(content.clone()));
             return Err(ServerError::HashVerificationFailed {
                 path: path.to_string(),
                 expected: self.hash_manager.to_hex(metadata.xxhash3),
                 actual: self.hash_manager.to_hex(actual_hash),
             });
         }
+
+        let bytes = Bytes::from(content);
+
+
 
         Ok(bytes)
     }
@@ -1052,8 +1108,7 @@ impl FileStorage {
             }
         })?;
 
-        let actual_hash = hash_bytes(&Bytes::from(content));
-        Ok(self.hash_manager.verify(metadata.xxhash3, actual_hash))
+        Ok(self.hash_manager.verify(&content, metadata.xxhash3))
     }
 
     /// Get storage statistics

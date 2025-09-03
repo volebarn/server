@@ -36,7 +36,7 @@
   - _Requirements: 3.4, 5.5, 1.18, 3.14_
 
 - [x] 3. Implement server storage layer
-- [ ] 3.1 Create async RocksDB metadata storage system
+- [x] 3.1 Create async RocksDB metadata storage system
   - Implement MetadataStore struct with RocksDB for persistent metadata storage using bitcode serialization
   - Add Snappy compression for all serialized metadata requiring compression
   - Set up column families for files, directories, hash index, and modified time index
