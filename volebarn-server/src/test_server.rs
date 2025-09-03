@@ -51,6 +51,7 @@ mod tests {
             max_request_size: 1024,
             request_timeout: 10,
             storage_root: temp_dir.path().to_path_buf(),
+            tls: crate::tls::TlsConfig::default(),
         };
         
         let server = Server::with_config(config).await.unwrap();

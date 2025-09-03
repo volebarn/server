@@ -15,7 +15,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }
 xxhash-rust = { workspace = true }
-rustls = { workspace = true }
+rustls = "0.21"
+rustls-pemfile = "1.0"
+axum-server = { version = "0.6", features = ["tls-rustls"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -24,6 +26,14 @@ crossbeam = { workspace = true }
 chrono = { workspace = true }
 futures = "0.3"
 base64 = "0.21"
+
+[dependencies.rcgen]
+version = "0.12"
+optional = true
+
+[features]
+default = []
+self-signed-certs = ["rcgen"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

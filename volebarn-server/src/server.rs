@@ -5,6 +5,7 @@
 
 use crate::{Result, ServerError};
 use crate::handlers::{AppState, upload_file, update_file, delete_file, get_file_metadata, list_directory, create_directory, delete_directory, search_files, get_file_or_directory, bulk_upload, get_manifest, sync_with_manifest, bulk_download, bulk_delete, move_file_or_directory, copy_file_or_directory};
+use crate::tls::TlsConfig;
 use axum::{
     extract::MatchedPath,
     http::{Request, StatusCode},
@@ -31,6 +32,8 @@ pub struct ServerConfig {
     pub request_timeout: u64,
     /// Storage root directory
     pub storage_root: PathBuf,
+    /// TLS configuration
+    pub tls: TlsConfig,
 }
 
 impl Default for ServerConfig {
@@ -41,6 +44,7 @@ impl Default for ServerConfig {
             max_request_size: 100 * 1024 * 1024, // 100MB
             request_timeout: 30,
             storage_root: PathBuf::from("./storage"),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -77,12 +81,15 @@ impl ServerConfig {
             .unwrap_or_else(|_| "./storage".to_string())
             .into();
 
+        let tls = TlsConfig::from_env()?;
+
         Ok(Self {
             host,
             port,
             max_request_size,
             request_timeout,
             storage_root,
+            tls,
         })
     }
     
@@ -167,8 +174,17 @@ impl Server {
     pub async fn run(self) -> Result<()> {
         let addr = self.config.socket_addr()?;
         
-        info!("Starting Volebarn server on {}", addr);
-        
+        if self.config.tls.is_enabled() {
+            info!("Starting Volebarn HTTPS server on {}", addr);
+            self.run_https(addr).await
+        } else {
+            info!("Starting Volebarn HTTP server on {}", addr);
+            self.run_http(addr).await
+        }
+    }
+    
+    /// Start HTTP server (no TLS)
+    async fn run_http(self, addr: SocketAddr) -> Result<()> {
         // Create TCP listener
         let listener = TcpListener::bind(&addr).await.map_err(|e| {
             ServerError::Config {
@@ -177,13 +193,44 @@ impl Server {
             }
         })?;
         
-        info!("Server listening on {}", addr);
+        info!("HTTP server listening on {}", addr);
         
         // Start serving requests
         axum::serve(listener, self.app)
             .await
             .map_err(|e| ServerError::Internal {
-                context: format!("Server error: {}", e),
+                context: format!("HTTP server error: {}", e),
+            })?;
+        
+        Ok(())
+    }
+    
+    /// Start HTTPS server with TLS
+    async fn run_https(self, addr: SocketAddr) -> Result<()> {
+        // Validate TLS configuration
+        self.config.tls.validate().await?;
+        
+        // Create TLS server configuration
+        let tls_config = self.config.tls.create_server_config().await?;
+        
+        info!("HTTPS server listening on {} with TLS 1.3", addr);
+        info!("Certificate: {}", self.config.tls.cert_path.display());
+        info!("Private key: {}", self.config.tls.key_path.display());
+        
+        if self.config.tls.require_client_cert {
+            info!("Client certificate verification enabled");
+            if let Some(ca_path) = &self.config.tls.ca_cert_path {
+                info!("CA certificates: {}", ca_path.display());
+            }
+        }
+        
+        // Start HTTPS server using axum-server with rustls
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+        axum_server::bind_rustls(addr, rustls_config)
+            .serve(self.app.into_make_service())
+            .await
+            .map_err(|e| ServerError::Internal {
+                context: format!("HTTPS server error: {}", e),
             })?;
         
         Ok(())

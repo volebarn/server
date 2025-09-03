@@ -435,6 +435,7 @@ async fn test_server_binding() {
         max_request_size: 1024 * 1024, // 1MB
         request_timeout: 10,
         storage_root: temp_dir.path().to_path_buf(),
+        tls: volebarn_server::tls::TlsConfig::default(),
     };
 
     // Create server instance
@@ -462,6 +463,7 @@ fn test_invalid_server_config() {
         max_request_size: 1024,
         request_timeout: 10,
         storage_root: std::path::PathBuf::from("./storage"),
+        tls: volebarn_server::tls::TlsConfig::default(),
     };
 
     // This should fail when trying to create socket address
