@@ -1,6 +1,13 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::is_x86_feature_detected;
 
+// Compression algorithm imports
+use brotli;
+use lz4_flex;
+use snap;
+use xxhash_rust;
+use zstd;
+
 /// SIMD capability detection and optimization utilities
 #[derive(Debug, Clone)]
 pub struct SimdCapabilities {
@@ -162,6 +169,173 @@ pub struct PerformanceInfo {
 impl Default for SimdSerializer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Compression algorithm benchmarker with SIMD optimizations
+pub struct CompressionBenchmarker {
+    capabilities: SimdCapabilities,
+}
+
+impl CompressionBenchmarker {
+    pub fn new() -> Self {
+        Self {
+            capabilities: SimdCapabilities::detect(),
+        }
+    }
+    
+    /// Compress data using Zstandard with specified compression level
+    pub fn compress_zstd(&self, data: &[u8], level: i32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(zstd::bulk::compress(data, level)?)
+    }
+    
+    /// Decompress Zstandard data
+    pub fn decompress_zstd(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(zstd::bulk::decompress(data, 10 * 1024 * 1024)?) // 10MB max
+    }
+    
+    /// Compress data using LZ4
+    pub fn compress_lz4(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(lz4_flex::compress_prepend_size(data))
+    }
+    
+    /// Decompress LZ4 data
+    pub fn decompress_lz4(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(lz4_flex::decompress_size_prepended(data)?)
+    }
+    
+    /// Compress data using Brotli with specified quality level
+    pub fn compress_brotli(&self, data: &[u8], quality: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        let params = brotli::enc::BrotliEncoderParams {
+            quality: quality as i32,
+            ..Default::default()
+        };
+        brotli::BrotliCompress(&mut std::io::Cursor::new(data), &mut output, &params)?;
+        Ok(output)
+    }
+    
+    /// Decompress Brotli data
+    pub fn decompress_brotli(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        brotli::BrotliDecompress(&mut std::io::Cursor::new(data), &mut output)?;
+        Ok(output)
+    }
+    
+    /// Compress data using Snappy
+    pub fn compress_snappy(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(snap::raw::Encoder::new().compress_vec(data)?)
+    }
+    
+    /// Decompress Snappy data
+    pub fn decompress_snappy(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(snap::raw::Decoder::new().decompress_vec(data)?)
+    }
+    
+    /// Analyze compression ratios for all algorithms
+    pub fn analyze_compression_ratios(&self, data: &[u8]) -> CompressionAnalysis {
+        let original_size = data.len();
+        
+        let zstd_compressed = self.compress_zstd(data, 3).unwrap_or_default();
+        let lz4_compressed = self.compress_lz4(data).unwrap_or_default();
+        let brotli_compressed = self.compress_brotli(data, 6).unwrap_or_default();
+        let snappy_compressed = self.compress_snappy(data).unwrap_or_default();
+        
+        CompressionAnalysis {
+            original_size,
+            zstd_size: zstd_compressed.len(),
+            lz4_size: lz4_compressed.len(),
+            brotli_size: brotli_compressed.len(),
+            snappy_size: snappy_compressed.len(),
+            zstd_ratio: original_size as f64 / zstd_compressed.len().max(1) as f64,
+            lz4_ratio: original_size as f64 / lz4_compressed.len().max(1) as f64,
+            brotli_ratio: original_size as f64 / brotli_compressed.len().max(1) as f64,
+            snappy_ratio: original_size as f64 / snappy_compressed.len().max(1) as f64,
+        }
+    }
+    
+    /// SIMD-optimized hash calculation using xxHash3
+    pub fn hash_simd_optimized(&self, data: &[u8]) -> u64 {
+        // xxhash-rust already includes SIMD optimizations when available
+        // The library automatically uses AVX2/AVX-512 on x86_64 and NEON on ARM64
+        xxhash_rust::xxh3::xxh3_64(data)
+    }
+    
+    /// Generate comprehensive performance report
+    pub fn generate_performance_report(&self, data: &[u8]) -> PerformanceReport {
+        let analysis = self.analyze_compression_ratios(data);
+        let hash = self.hash_simd_optimized(data);
+        
+        PerformanceReport {
+            simd_capabilities: self.capabilities.clone(),
+            compression_analysis: analysis.clone(),
+            hash_verification: hash,
+            recommended_algorithm: self.select_optimal_algorithm(&analysis),
+        }
+    }
+    
+    /// Select optimal compression algorithm based on analysis
+    fn select_optimal_algorithm(&self, analysis: &CompressionAnalysis) -> CompressionAlgorithm {
+        // Selection criteria:
+        // 1. For high compression ratio needs: Brotli or Zstd
+        // 2. For speed: LZ4 or Snappy
+        // 3. For balanced: Zstd level 3
+        
+        if analysis.brotli_ratio > analysis.zstd_ratio && analysis.brotli_ratio > 2.0 {
+            CompressionAlgorithm::Brotli
+        } else if analysis.zstd_ratio > 1.8 {
+            CompressionAlgorithm::Zstd
+        } else if analysis.lz4_ratio > 1.2 {
+            CompressionAlgorithm::Lz4
+        } else {
+            CompressionAlgorithm::Snappy
+        }
+    }
+}
+
+impl Default for CompressionBenchmarker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompressionAnalysis {
+    pub original_size: usize,
+    pub zstd_size: usize,
+    pub lz4_size: usize,
+    pub brotli_size: usize,
+    pub snappy_size: usize,
+    pub zstd_ratio: f64,
+    pub lz4_ratio: f64,
+    pub brotli_ratio: f64,
+    pub snappy_ratio: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PerformanceReport {
+    pub simd_capabilities: SimdCapabilities,
+    pub compression_analysis: CompressionAnalysis,
+    pub hash_verification: u64,
+    pub recommended_algorithm: CompressionAlgorithm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionAlgorithm {
+    Zstd,
+    Lz4,
+    Brotli,
+    Snappy,
+}
+
+impl std::fmt::Display for CompressionAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompressionAlgorithm::Zstd => write!(f, "zstd"),
+            CompressionAlgorithm::Lz4 => write!(f, "lz4"),
+            CompressionAlgorithm::Brotli => write!(f, "brotli"),
+            CompressionAlgorithm::Snappy => write!(f, "snappy"),
+        }
     }
 }
 
