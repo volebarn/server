@@ -127,12 +127,18 @@ fn benchmark_scenario(
     
     let mut results = Vec::new();
     
-    // Test key combinations only (for speed)
+    // Test key combinations including bitcode
     let combinations = [
         ("Zstd", "Bincode"),
         ("LZ4", "Bincode"),
         ("Snappy", "Bincode"),
         ("Zstd", "JSON"),
+        #[cfg(feature = "bitcode")]
+        ("Zstd", "Bitcode"),
+        #[cfg(feature = "bitcode")]
+        ("LZ4", "Bitcode"),
+        #[cfg(feature = "bitcode")]
+        ("Snappy", "Bitcode"),
     ];
     
     for (compression_alg, serialization_format) in combinations {
