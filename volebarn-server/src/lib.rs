@@ -11,6 +11,9 @@ pub mod types;
 pub mod hash;
 pub mod tls;
 
+#[cfg(test)]
+pub mod test_server;
+
 pub use error::ServerError;
 pub use server::Server;
 pub use types::*;
