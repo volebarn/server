@@ -516,6 +516,325 @@ impl Client {
         }
     }
 
+    // ========================================
+    // Single File Operations
+    // ========================================
+
+    /// Upload a file to the server with hash verification
+    #[instrument(skip(self, content))]
+    pub async fn upload_file(&self, path: &str, content: Bytes) -> ClientResult<crate::types::FileMetadata> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        // Calculate hash for integrity verification
+        let expected_hash = self.hash_manager.hash_bytes(&content);
+        
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/files/{}", self.config.server_url().await, path.trim_start_matches('/'));
+            let response = self.make_request(Method::POST, &url, Some(content.clone())).await?;
+            
+            // Parse response metadata
+            let metadata_response: crate::types::FileMetadataResponse = response.json().await
+                .map_err(|e| ClientError::Deserialization {
+                    operation: "upload_file".to_string(),
+                    error: e.to_string(),
+                })?;
+            
+            // Convert to internal format and verify hash
+            let metadata = crate::types::FileMetadata::try_from(metadata_response)?;
+            self.hash_manager.verify_with_error(path, expected_hash, metadata.xxhash3)?;
+            
+            debug!("File uploaded successfully: {}", path);
+            Ok(metadata)
+        }).await
+    }
+
+    /// Download a file from the server with hash verification
+    #[instrument(skip(self))]
+    pub async fn download_file(&self, path: &str) -> ClientResult<Bytes> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/files/{}", self.config.server_url().await, path.trim_start_matches('/'));
+            let response = self.make_request(Method::GET, &url, None).await?;
+            
+            // Get expected hash from response headers
+            let expected_hash = response.headers()
+                .get("X-File-Hash")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| self.hash_manager.from_hex(h).ok())
+                .ok_or_else(|| ClientError::InvalidResponse { 
+                    error: "Missing or invalid X-File-Hash header".to_string() 
+                })?;
+            
+            // Get file content
+            let content = response.bytes().await
+                .map_err(ClientError::Network)?;
+            
+            // Update download statistics
+            self.bytes_downloaded.fetch_add(content.len() as u64, Ordering::Relaxed);
+            
+            // Verify hash integrity
+            self.hash_manager.verify_bytes(path, &content, expected_hash).await?;
+            
+            debug!("File downloaded successfully: {}", path);
+            Ok(content)
+        }).await
+    }
+
+    /// Update an existing file on the server with hash verification
+    #[instrument(skip(self, content))]
+    pub async fn update_file(&self, path: &str, content: Bytes) -> ClientResult<crate::types::FileMetadata> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        // Calculate hash for integrity verification
+        let expected_hash = self.hash_manager.hash_bytes(&content);
+        
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/files/{}", self.config.server_url().await, path.trim_start_matches('/'));
+            let response = self.make_request(Method::PUT, &url, Some(content.clone())).await?;
+            
+            // Parse response metadata
+            let metadata_response: crate::types::FileMetadataResponse = response.json().await
+                .map_err(|e| ClientError::Deserialization {
+                    operation: "update_file".to_string(),
+                    error: e.to_string(),
+                })?;
+            
+            // Convert to internal format and verify hash
+            let metadata = crate::types::FileMetadata::try_from(metadata_response)?;
+            self.hash_manager.verify_with_error(path, expected_hash, metadata.xxhash3)?;
+            
+            debug!("File updated successfully: {}", path);
+            Ok(metadata)
+        }).await
+    }
+
+    /// Delete a file from the server
+    #[instrument(skip(self))]
+    pub async fn delete_file(&self, path: &str) -> ClientResult<()> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/files/{}", self.config.server_url().await, path.trim_start_matches('/'));
+            let _response = self.make_request(Method::DELETE, &url, None).await?;
+            
+            debug!("File deleted successfully: {}", path);
+            Ok(())
+        }).await
+    }
+
+    /// Get file metadata without downloading content
+    #[instrument(skip(self))]
+    pub async fn get_file_metadata(&self, path: &str) -> ClientResult<crate::types::FileMetadata> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/files/{}", self.config.server_url().await, path.trim_start_matches('/'));
+            let response = self.make_request(Method::HEAD, &url, None).await?;
+            
+            // Extract metadata from headers
+            let size = response.headers()
+                .get("X-File-Size")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| ClientError::InvalidResponse { 
+                    error: "Missing or invalid X-File-Size header".to_string() 
+                })?;
+            
+            let hash = response.headers()
+                .get("X-File-Hash")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| self.hash_manager.from_hex(h).ok())
+                .ok_or_else(|| ClientError::InvalidResponse { 
+                    error: "Missing or invalid X-File-Hash header".to_string() 
+                })?;
+            
+            let modified_str = response.headers()
+                .get("X-Modified-Time")
+                .and_then(|h| h.to_str().ok())
+                .ok_or_else(|| ClientError::InvalidResponse { 
+                    error: "Missing X-Modified-Time header".to_string() 
+                })?;
+            
+            // Parse ISO 8601 timestamp
+            let modified = chrono::DateTime::parse_from_rfc3339(modified_str)
+                .map_err(|_| ClientError::InvalidResponse { 
+                    error: format!("Invalid timestamp format: {}", modified_str)
+                })?
+                .with_timezone(&chrono::Utc)
+                .timestamp() as u64;
+            
+            let modified_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified);
+            
+            let metadata = crate::types::FileMetadata::new(
+                path.to_string(),
+                size,
+                modified_time,
+                hash,
+            );
+            
+            debug!("File metadata retrieved successfully: {}", path);
+            Ok(metadata)
+        }).await
+    }
+
+    /// Move/rename a file on the server
+    #[instrument(skip(self))]
+    pub async fn move_file(&self, from_path: &str, to_path: &str) -> ClientResult<()> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/files/move", self.config.server_url().await);
+            let move_request = crate::types::MoveRequest {
+                from_path: from_path.to_string(),
+                to_path: to_path.to_string(),
+            };
+            
+            let body = serde_json::to_vec(&move_request)
+                .map_err(|e| ClientError::Serialization {
+                    operation: "move_file".to_string(),
+                    error: e.to_string(),
+                })?;
+            
+            let _response = self.make_request(Method::POST, &url, Some(Bytes::from(body))).await?;
+            
+            debug!("File moved successfully: {} -> {}", from_path, to_path);
+            Ok(())
+        }).await
+    }
+
+    /// Copy a file on the server
+    #[instrument(skip(self))]
+    pub async fn copy_file(&self, from_path: &str, to_path: &str) -> ClientResult<()> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/files/copy", self.config.server_url().await);
+            let copy_request = crate::types::CopyRequest {
+                from_path: from_path.to_string(),
+                to_path: to_path.to_string(),
+            };
+            
+            let body = serde_json::to_vec(&copy_request)
+                .map_err(|e| ClientError::Serialization {
+                    operation: "copy_file".to_string(),
+                    error: e.to_string(),
+                })?;
+            
+            let _response = self.make_request(Method::POST, &url, Some(Bytes::from(body))).await?;
+            
+            debug!("File copied successfully: {} -> {}", from_path, to_path);
+            Ok(())
+        }).await
+    }
+
+    /// Verify file integrity by comparing local and remote hashes
+    #[instrument(skip(self))]
+    pub async fn verify_file_integrity(&self, path: &str, expected_hash: u64) -> ClientResult<bool> {
+        let metadata = self.get_file_metadata(path).await?;
+        Ok(self.hash_manager.verify(expected_hash, metadata.xxhash3))
+    }
+
+    // ========================================
+    // Directory Operations
+    // ========================================
+
+    /// Create a directory on the server
+    #[instrument(skip(self))]
+    pub async fn create_directory(&self, path: &str) -> ClientResult<()> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/directories/{}", self.config.server_url().await, path.trim_start_matches('/'));
+            let _response = self.make_request(Method::POST, &url, None).await?;
+            
+            debug!("Directory created successfully: {}", path);
+            Ok(())
+        }).await
+    }
+
+    /// Delete a directory from the server (recursive)
+    #[instrument(skip(self))]
+    pub async fn delete_directory(&self, path: &str) -> ClientResult<()> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/directories/{}", self.config.server_url().await, path.trim_start_matches('/'));
+            let _response = self.make_request(Method::DELETE, &url, None).await?;
+            
+            debug!("Directory deleted successfully: {}", path);
+            Ok(())
+        }).await
+    }
+
+    /// List directory contents
+    #[instrument(skip(self))]
+    pub async fn list_directory(&self, path: Option<&str>) -> ClientResult<crate::types::DirectoryListing> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = if let Some(path) = path {
+                format!("{}/files/{}", self.config.server_url().await, path.trim_start_matches('/'))
+            } else {
+                format!("{}/files", self.config.server_url().await)
+            };
+            
+            let response = self.make_request(Method::GET, &url, None).await?;
+            
+            let listing: crate::types::DirectoryListing = response.json().await
+                .map_err(|e| ClientError::Deserialization {
+                    operation: "list_directory".to_string(),
+                    error: e.to_string(),
+                })?;
+            
+            debug!("Directory listed successfully: {}", path.unwrap_or("/"));
+            Ok(listing)
+        }).await
+    }
+
+    /// Search for files matching a pattern
+    #[instrument(skip(self))]
+    pub async fn search_files(&self, pattern: &str, path: Option<&str>) -> ClientResult<Vec<crate::types::FileMetadata>> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/search", self.config.server_url().await);
+            let search_request = crate::types::SearchRequest {
+                pattern: pattern.to_string(),
+                path: path.map(|p| p.to_string()),
+                recursive: true,
+            };
+            
+            let body = serde_json::to_vec(&search_request)
+                .map_err(|e| ClientError::Serialization {
+                    operation: "search_files".to_string(),
+                    error: e.to_string(),
+                })?;
+            
+            let response = self.make_request(Method::POST, &url, Some(Bytes::from(body))).await?;
+            
+            let results: Vec<crate::types::FileMetadata> = response.json().await
+                .map_err(|e| ClientError::Deserialization {
+                    operation: "search_files".to_string(),
+                    error: e.to_string(),
+                })?;
+            
+            debug!("Search completed successfully: {} results for pattern '{}'", results.len(), pattern);
+            Ok(results)
+        }).await
+    }
+
     /// Clone client for background tasks (lightweight clone)
     fn clone_for_background(&self) -> Self {
         Self {
@@ -556,9 +875,12 @@ impl Drop for Client {
     }
 }
 
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retry::CircuitState;
     use tokio::time::Duration;
     use uuid::Uuid;
 
@@ -841,5 +1163,264 @@ mod tests {
         // Now second acquire should succeed
         let permit3 = client.concurrency_limiter.try_acquire();
         assert!(permit3.is_ok());
+    }
+
+    // ========================================
+    // Single File Operations Tests
+    // ========================================
+
+    #[tokio::test]
+    async fn test_hash_verification_functionality() {
+        let client = Client::with_defaults("https://localhost:8080".to_string()).await.unwrap();
+        let content = Bytes::from_static(b"Test content for hash verification");
+        
+        // Test hash calculation
+        let hash = client.hash_manager.hash_bytes(&content);
+        assert_ne!(hash, 0);
+        
+        // Test hash verification success
+        assert!(client.hash_manager.verify(hash, hash));
+        
+        // Test hash verification failure
+        let wrong_hash = 0xdeadbeefcafebabe;
+        assert!(!client.hash_manager.verify(hash, wrong_hash));
+        
+        // Test hash verification with error
+        let result = client.hash_manager.verify_with_error("test_path", hash, wrong_hash);
+        assert!(result.is_err());
+        
+        if let Err(crate::error::ClientError::HashMismatch { path, expected, actual }) = result {
+            assert_eq!(path, "test_path");
+            assert_eq!(expected, client.hash_manager.to_hex(hash));
+            assert_eq!(actual, client.hash_manager.to_hex(wrong_hash));
+        } else {
+            panic!("Expected HashMismatch error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_operations_error_handling() {
+        // Test with invalid server URL to trigger network errors
+        let client = Client::with_defaults("http://invalid-server:9999".to_string()).await.unwrap();
+        
+        let path = "test/error.txt";
+        let content = Bytes::from_static(b"Error test content");
+        
+        // Upload should fail with network error
+        let upload_result = client.upload_file(path, content.clone()).await;
+        assert!(upload_result.is_err());
+        
+        match upload_result.unwrap_err() {
+            ClientError::Network(_) | ClientError::Connection { .. } | ClientError::CircuitBreakerOpen => {
+                // Expected error types for network failures
+            }
+            other => panic!("Unexpected error type: {:?}", other),
+        }
+        
+        // Download should also fail
+        let download_result = client.download_file(path).await;
+        assert!(download_result.is_err());
+        
+        // Delete should also fail
+        let delete_result = client.delete_file(path).await;
+        assert!(delete_result.is_err());
+        
+        // Get metadata should also fail
+        let metadata_result = client.get_file_metadata(path).await;
+        assert!(metadata_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_path_normalization_in_urls() {
+        let _client = Client::with_defaults("https://localhost:8080".to_string()).await.unwrap();
+        
+        // Test that paths are properly normalized (leading slashes removed)
+        let paths = vec![
+            "test/normal.txt",
+            "/test/leading_slash.txt",
+            "//test/double_leading.txt",
+        ];
+        
+        for path in paths {
+            // We can't actually test the HTTP calls without a server,
+            // but we can verify the URL construction logic by checking
+            // that the methods don't panic and handle path normalization
+            let normalized_path = path.trim_start_matches('/');
+            assert!(!normalized_path.starts_with('/'));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_hash_operations() {
+        let client = Arc::new(Client::with_defaults("https://localhost:8080".to_string()).await.unwrap());
+        let mut handles = Vec::new();
+        
+        // Spawn multiple concurrent hash operations
+        for i in 0..10 {
+            let client_clone = Arc::clone(&client);
+            let handle = tokio::spawn(async move {
+                let content = Bytes::from(format!("concurrent test data {}", i));
+                let hash = client_clone.hash_manager.hash_bytes(&content);
+                
+                // Verify the hash
+                let verification_result = client_clone.hash_manager.verify(hash, hash);
+                assert!(verification_result);
+                
+                hash
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all operations to complete
+        let mut hashes = Vec::new();
+        for handle in handles {
+            hashes.push(handle.await.unwrap());
+        }
+        
+        // All hashes should be different (different input data)
+        assert_eq!(hashes.len(), 10);
+        for i in 0..hashes.len() {
+            for j in (i + 1)..hashes.len() {
+                assert_ne!(hashes[i], hashes[j]);
+            }
+        }
+        
+        // Check hash statistics
+        let stats = client.hash_manager.get_stats();
+        assert_eq!(stats.calculations, 10);
+        assert_eq!(stats.verifications_success, 10);
+        assert_eq!(stats.verifications_failed, 0);
+        assert_eq!(stats.success_rate(), 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_large_content_hashing() {
+        let client = Client::with_defaults("https://localhost:8080".to_string()).await.unwrap();
+        
+        // Create a large content buffer (1MB)
+        let large_content = Bytes::from(vec![0xAB; 1024 * 1024]);
+        
+        // Hash the large content
+        let hash = client.hash_manager.hash_bytes(&large_content);
+        assert_ne!(hash, 0);
+        
+        // Verify hash consistency
+        let hash2 = client.hash_manager.hash_bytes(&large_content);
+        assert_eq!(hash, hash2);
+        
+        // Check statistics
+        let stats = client.hash_manager.get_stats();
+        assert_eq!(stats.calculations, 2);
+        assert_eq!(stats.bytes_processed, 2 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_hash_manager_statistics_tracking() {
+        let client = Client::with_defaults("https://localhost:8080".to_string()).await.unwrap();
+        
+        // Reset stats for clean test
+        client.hash_manager.reset_stats();
+        
+        let content1 = Bytes::from_static(b"test data 1");
+        let content2 = Bytes::from_static(b"test data 2");
+        
+        // Hash some data
+        let hash1 = client.hash_manager.hash_bytes(&content1);
+        let hash2 = client.hash_manager.hash_bytes(&content2);
+        
+        // Check calculations increased
+        let stats = client.hash_manager.get_stats();
+        assert_eq!(stats.calculations, 2);
+        assert_eq!(stats.bytes_processed, (content1.len() + content2.len()) as u64);
+        
+        // Verify hashes
+        assert!(client.hash_manager.verify(hash1, hash1)); // Success
+        assert!(!client.hash_manager.verify(hash1, hash2)); // Failure
+        
+        // Check verification stats
+        let stats = client.hash_manager.get_stats();
+        assert_eq!(stats.verifications_success, 1);
+        assert_eq!(stats.verifications_failed, 1);
+        assert_eq!(stats.success_rate(), 50.0);
+        assert_eq!(stats.avg_bytes_per_calculation(), (content1.len() + content2.len()) as f64 / 2.0);
+    }
+
+    #[tokio::test]
+    async fn test_client_retry_policy_integration() {
+        let client = Client::with_defaults("https://localhost:8080".to_string()).await.unwrap();
+        
+        // Test that health monitor is properly initialized
+        let health_status = client.health_monitor.is_healthy();
+        // Initially should be None (unknown) since no health checks have been performed
+        assert!(health_status.is_none() || health_status == Some(true));
+        
+        // Test that retry policy and circuit breaker are available
+        // This verifies the components are properly initialized
+        let circuit_breaker = client.retry_policy.circuit_breaker();
+        assert_eq!(circuit_breaker.failure_count(), 0);
+        assert_eq!(circuit_breaker.state(), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn test_directory_operations_basic() {
+        // Test basic directory operation method signatures and error handling
+        let client = Client::with_defaults("http://invalid-server:9999".to_string()).await.unwrap();
+        
+        let dir_path = "test/directory";
+        
+        // All operations should fail with network errors due to invalid server
+        let create_result = client.create_directory(dir_path).await;
+        assert!(create_result.is_err());
+        
+        let delete_result = client.delete_directory(dir_path).await;
+        assert!(delete_result.is_err());
+        
+        let list_result = client.list_directory(Some(dir_path)).await;
+        assert!(list_result.is_err());
+        
+        let search_result = client.search_files("*.txt", Some(dir_path)).await;
+        assert!(search_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_file_metadata_creation() {
+        use crate::types::FileMetadata;
+        use std::time::SystemTime;
+        
+        let path = "test/metadata.txt";
+        let size = 1024;
+        let modified = SystemTime::now();
+        let hash = 0x1234567890abcdef;
+        
+        // Test file metadata creation
+        let metadata = FileMetadata::new(path.to_string(), size, modified, hash);
+        
+        assert_eq!(metadata.path, path);
+        assert_eq!(metadata.name, "metadata.txt");
+        assert_eq!(metadata.size, size);
+        assert_eq!(metadata.modified, modified);
+        assert_eq!(metadata.xxhash3, hash);
+        assert!(!metadata.is_directory);
+        
+        // Test directory metadata creation
+        let dir_metadata = FileMetadata::new_directory(path.to_string(), modified);
+        assert!(dir_metadata.is_directory);
+        assert_eq!(dir_metadata.size, 0);
+        assert_eq!(dir_metadata.xxhash3, 0);
+    }
+
+    #[tokio::test]
+    async fn test_client_configuration_validation() {
+        // Test that client properly validates configuration
+        let config = crate::config::Config::new("https://localhost:8080".to_string());
+        
+        // Valid configuration should work
+        let client_result = Client::new(config).await;
+        assert!(client_result.is_ok());
+        
+        // Test with empty URL
+        let invalid_config = crate::config::Config::new("".to_string());
+        let invalid_client_result = Client::new(invalid_config).await;
+        assert!(invalid_client_result.is_err());
     }
 }

@@ -20,7 +20,10 @@ crossbeam = { workspace = true }
 
 # Additional client dependencies
 fastrand = "2.0"
+chrono = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
