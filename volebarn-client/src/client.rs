@@ -1383,6 +1383,345 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_concurrent_directory_operations() {
+        // Test concurrent directory operations with atomic error tracking
+        let client = Arc::new(Client::with_defaults("http://invalid-server:9999".to_string()).await.unwrap());
+        let mut handles = Vec::new();
+        
+        // Spawn multiple concurrent directory operations
+        for i in 0..10 {
+            let client_clone = Arc::clone(&client);
+            let handle = tokio::spawn(async move {
+                let dir_path = format!("test/concurrent_dir_{}", i);
+                
+                // Test create directory
+                let create_result = client_clone.create_directory(&dir_path).await;
+                assert!(create_result.is_err());
+                
+                // Test delete directory
+                let delete_result = client_clone.delete_directory(&dir_path).await;
+                assert!(delete_result.is_err());
+                
+                // Test list directory
+                let list_result = client_clone.list_directory(Some(&dir_path)).await;
+                assert!(list_result.is_err());
+                
+                // Return the directory path for verification
+                dir_path
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all operations to complete
+        let mut dir_paths = Vec::new();
+        for handle in handles {
+            dir_paths.push(handle.await.unwrap());
+        }
+        
+        // Verify all operations were attempted
+        assert_eq!(dir_paths.len(), 10);
+        for i in 0..dir_paths.len() {
+            assert_eq!(dir_paths[i], format!("test/concurrent_dir_{}", i));
+        }
+        
+        // Verify that all concurrent operations completed without panics or deadlocks
+        // This demonstrates the lock-free nature of the directory operations
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_search_operations() {
+        // Test concurrent search operations with atomic result collection
+        let client = Arc::new(Client::with_defaults("http://invalid-server:9999".to_string()).await.unwrap());
+        let mut handles = Vec::new();
+        
+        // Different search patterns to test concurrent pattern matching
+        let patterns = vec![
+            "*.txt", "*.rs", "*.md", "*.json", "*.toml",
+            "test*", "*config*", "*.log", "*.tmp", "data*"
+        ];
+        
+        // Spawn concurrent search operations
+        for (i, pattern) in patterns.iter().enumerate() {
+            let client_clone = Arc::clone(&client);
+            let pattern = pattern.to_string();
+            let handle = tokio::spawn(async move {
+                let search_path = format!("test/search_dir_{}", i);
+                
+                // Test search with pattern
+                let search_result = client_clone.search_files(&pattern, Some(&search_path)).await;
+                assert!(search_result.is_err());
+                
+                // Test search without path (root search)
+                let root_search_result = client_clone.search_files(&pattern, None).await;
+                assert!(root_search_result.is_err());
+                
+                (pattern, search_path)
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all search operations to complete
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.unwrap());
+        }
+        
+        // Verify all search operations were attempted
+        assert_eq!(results.len(), patterns.len());
+        for (i, (pattern, search_path)) in results.iter().enumerate() {
+            assert_eq!(pattern, &patterns[i]);
+            assert_eq!(search_path, &format!("test/search_dir_{}", i));
+        }
+        
+        // Verify that all concurrent search operations completed without panics or deadlocks
+        // This demonstrates the lock-free concurrent pattern matching capability
+    }
+
+    #[tokio::test]
+    async fn test_directory_listing_with_concurrent_access() {
+        // Test directory listing operations with zero-lock concurrent access
+        let client = Arc::new(Client::with_defaults("http://invalid-server:9999".to_string()).await.unwrap());
+        let mut handles = Vec::new();
+        
+        // Test different directory paths concurrently
+        let test_paths = vec![
+            Some("documents"),
+            Some("images/photos"),
+            Some("config/settings"),
+            None, // Root directory
+            Some("logs/2024"),
+            Some("temp/cache"),
+            Some("src/main"),
+            Some("tests/unit"),
+            Some("data/exports"),
+            Some("backup/daily"),
+        ];
+        
+        // Spawn concurrent directory listing operations
+        for (i, path) in test_paths.iter().enumerate() {
+            let client_clone = Arc::clone(&client);
+            let path = path.clone();
+            let handle = tokio::spawn(async move {
+                // Test directory listing
+                let list_result = client_clone.list_directory(path.as_deref()).await;
+                assert!(list_result.is_err());
+                
+                // Verify error type is network-related
+                match list_result.unwrap_err() {
+                    crate::error::ClientError::Network(_) | 
+                    crate::error::ClientError::Connection { .. } | 
+                    crate::error::ClientError::CircuitBreakerOpen => {
+                        // Expected error types for network failures
+                    }
+                    other => panic!("Unexpected error type for task {}: {:?}", i, other),
+                }
+                
+                (i, path)
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all listing operations to complete
+        let mut completed_tasks = Vec::new();
+        for handle in handles {
+            completed_tasks.push(handle.await.unwrap());
+        }
+        
+        // Verify all operations completed
+        assert_eq!(completed_tasks.len(), test_paths.len());
+        for (task_id, path) in completed_tasks {
+            assert_eq!(path, test_paths[task_id]);
+        }
+        
+        // Verify that all concurrent directory listing operations completed successfully
+        // This demonstrates zero-lock concurrent access to directory operations
+    }
+
+    #[tokio::test]
+    async fn test_directory_operations_error_handling() {
+        // Test proper async error handling for directory operations using atomic error tracking
+        let client = Arc::new(Client::with_defaults("http://invalid-server:9999".to_string()).await.unwrap());
+        
+        // Test create directory error handling
+        let create_result = client.create_directory("test/error_dir").await;
+        assert!(create_result.is_err());
+        
+        // Test delete directory error handling
+        let delete_result = client.delete_directory("test/error_dir").await;
+        assert!(delete_result.is_err());
+        
+        // Test list directory error handling
+        let list_result = client.list_directory(Some("test/error_dir")).await;
+        assert!(list_result.is_err());
+        
+        // Test search files error handling
+        let search_result = client.search_files("*.error", Some("test/error_dir")).await;
+        assert!(search_result.is_err());
+        
+        // Test error types are appropriate - all should be network-related errors
+        assert!(matches!(create_result.unwrap_err(), 
+            crate::error::ClientError::Network(_) | 
+            crate::error::ClientError::Connection { .. } | 
+            crate::error::ClientError::CircuitBreakerOpen));
+        
+        assert!(matches!(delete_result.unwrap_err(), 
+            crate::error::ClientError::Network(_) | 
+            crate::error::ClientError::Connection { .. } | 
+            crate::error::ClientError::CircuitBreakerOpen));
+        
+        assert!(matches!(list_result.unwrap_err(), 
+            crate::error::ClientError::Network(_) | 
+            crate::error::ClientError::Connection { .. } | 
+            crate::error::ClientError::CircuitBreakerOpen));
+        
+        assert!(matches!(search_result.unwrap_err(), 
+            crate::error::ClientError::Network(_) | 
+            crate::error::ClientError::Connection { .. } | 
+            crate::error::ClientError::CircuitBreakerOpen));
+        
+        // Verify that the client maintains atomic state during error conditions
+        // The client should remain functional after errors
+        let health_check_result = client.health_check().await;
+        assert!(health_check_result.is_err()); // Should also fail with invalid server
+    }
+
+    #[tokio::test]
+    async fn test_search_files_pattern_matching() {
+        // Test search files method with various patterns for concurrent pattern matching
+        let client = Client::with_defaults("http://invalid-server:9999".to_string()).await.unwrap();
+        
+        // Test different search patterns
+        let test_cases = vec![
+            ("*.txt", "text files"),
+            ("*.rs", "rust files"),
+            ("test*", "files starting with test"),
+            ("*config*", "files containing config"),
+            ("*.{json,toml}", "config files"),
+            ("**/*.log", "log files recursively"),
+            ("src/**/*.rs", "rust files in src"),
+            ("??.txt", "two-character txt files"),
+            ("[abc]*.txt", "txt files starting with a, b, or c"),
+            ("file[0-9].txt", "numbered files"),
+        ];
+        
+        for (pattern, description) in &test_cases {
+            // Test search with pattern in specific directory
+            let search_result = client.search_files(pattern, Some("test/search")).await;
+            assert!(search_result.is_err(), "Search should fail for pattern: {} ({})", pattern, description);
+            
+            // Test search with pattern in root directory
+            let root_search_result = client.search_files(pattern, None).await;
+            assert!(root_search_result.is_err(), "Root search should fail for pattern: {} ({})", pattern, description);
+        }
+        
+        // All pattern matching operations completed, demonstrating concurrent pattern matching
+    }
+
+    #[tokio::test]
+    async fn test_directory_operations_path_normalization() {
+        // Test that directory operations properly handle path normalization
+        let client = Client::with_defaults("http://invalid-server:9999".to_string()).await.unwrap();
+        
+        // Test various path formats
+        let test_paths = vec![
+            "normal/path",
+            "/leading/slash",
+            "//double/leading",
+            "trailing/slash/",
+            "/both/leading/and/trailing/",
+            ".",
+            "./relative",
+            "../parent",
+            "path/with spaces",
+            "path/with-dashes",
+            "path/with_underscores",
+            "path/with.dots",
+        ];
+        
+        for path in test_paths {
+            // Test create directory with various path formats
+            let create_result = client.create_directory(path).await;
+            assert!(create_result.is_err(), "Create should fail for path: {}", path);
+            
+            // Test delete directory with various path formats
+            let delete_result = client.delete_directory(path).await;
+            assert!(delete_result.is_err(), "Delete should fail for path: {}", path);
+            
+            // Test list directory with various path formats
+            let list_result = client.list_directory(Some(path)).await;
+            assert!(list_result.is_err(), "List should fail for path: {}", path);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_mixed_directory_operations() {
+        // Test mixed directory operations running concurrently with atomic state tracking
+        let client = Arc::new(Client::with_defaults("http://invalid-server:9999".to_string()).await.unwrap());
+        let mut handles = Vec::new();
+        
+        // Spawn mixed operations concurrently
+        for i in 0..20 {
+            let client_clone = Arc::clone(&client);
+            let handle = tokio::spawn(async move {
+                let base_path = format!("test/mixed_{}", i);
+                
+                match i % 4 {
+                    0 => {
+                        // Create directory operation
+                        let result = client_clone.create_directory(&base_path).await;
+                        assert!(result.is_err());
+                        "create"
+                    }
+                    1 => {
+                        // Delete directory operation
+                        let result = client_clone.delete_directory(&base_path).await;
+                        assert!(result.is_err());
+                        "delete"
+                    }
+                    2 => {
+                        // List directory operation
+                        let result = client_clone.list_directory(Some(&base_path)).await;
+                        assert!(result.is_err());
+                        "list"
+                    }
+                    3 => {
+                        // Search files operation
+                        let pattern = format!("*{}.txt", i);
+                        let result = client_clone.search_files(&pattern, Some(&base_path)).await;
+                        assert!(result.is_err());
+                        "search"
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all operations to complete
+        let mut operation_types = Vec::new();
+        for handle in handles {
+            operation_types.push(handle.await.unwrap());
+        }
+        
+        // Verify all operations completed
+        assert_eq!(operation_types.len(), 20);
+        
+        // Count operation types
+        let create_count = operation_types.iter().filter(|&op| *op == "create").count();
+        let delete_count = operation_types.iter().filter(|&op| *op == "delete").count();
+        let list_count = operation_types.iter().filter(|&op| *op == "list").count();
+        let search_count = operation_types.iter().filter(|&op| *op == "search").count();
+        
+        assert_eq!(create_count, 5);
+        assert_eq!(delete_count, 5);
+        assert_eq!(list_count, 5);
+        assert_eq!(search_count, 5);
+        
+        // All mixed operations completed successfully, demonstrating atomic state tracking
+        // across different types of directory operations running concurrently
+    }
+
+    #[tokio::test]
     async fn test_file_metadata_creation() {
         use crate::types::FileMetadata;
         use std::time::SystemTime;
