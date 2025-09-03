@@ -873,7 +873,7 @@ impl Client {
         }).await
     }
 
-    /// List directory contents
+    /// List directory contents with Snappy compression and Bitcode serialization support
     #[instrument(skip(self))]
     pub async fn list_directory(&self, path: Option<&str>) -> ClientResult<crate::types::DirectoryListing> {
         let _permit = self.concurrency_limiter.acquire().await
@@ -886,24 +886,76 @@ impl Client {
                 format!("{}/files", self.config.server_url())
             };
             
-            let response = self.make_request(Method::GET, &url, None).await?;
+            // Make request with compression support headers
+            let mut request = self.http_client.get(&url);
+            request = request.header("Accept-Encoding", "snappy, gzip, deflate");
+            request = request.header("Accept", "application/json, application/octet-stream");
             
-            let listing: crate::types::DirectoryListing = response.json().await
-                .map_err(|e| ClientError::Deserialization {
-                    operation: "list_directory".to_string(),
-                    error: e.to_string(),
-                })?;
+            let response = timeout(
+                self.config.request_timeout(),
+                request.send()
+            ).await
+            .map_err(|_| ClientError::Timeout {
+                duration: self.config.request_timeout().as_secs(),
+                operation: "list_directory".to_string(),
+            })?
+            .map_err(ClientError::Network)?;
+
+            if !response.status().is_success() {
+                return Err(ClientError::Server {
+                    status: response.status().as_u16(),
+                    message: response.status().canonical_reason()
+                        .unwrap_or("Unknown error").to_string(),
+                });
+            }
+
+            // Check content encoding and handle accordingly
+            let content_encoding = response.headers()
+                .get("content-encoding")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            let content_type = response.headers()
+                .get("content-type")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+
+            let body_bytes = response.bytes().await
+                .map_err(ClientError::Network)?;
+
+            let listing = if content_encoding == "snappy" && content_type.contains("application/octet-stream") {
+                // Handle Snappy compressed Bitcode data
+                use crate::serialization::deserialize_compressed;
+                use crate::storage_types::StorageDirectoryListing;
+                
+                let storage_listing = deserialize_compressed::<StorageDirectoryListing>(&body_bytes)?;
+                storage_listing.into()
+            } else {
+                // Handle standard JSON response
+                serde_json::from_slice::<crate::types::DirectoryListing>(&body_bytes)
+                    .map_err(|e| ClientError::Deserialization {
+                        operation: "list_directory".to_string(),
+                        error: e.to_string(),
+                    })?
+            };
             
-            debug!("Directory listed successfully: {}", path.unwrap_or("/"));
+            debug!("Directory listed successfully: {} (encoding: {}, type: {})", 
+                   path.unwrap_or("/"), content_encoding, content_type);
             Ok(listing)
         }).await
     }
 
-    /// Search for files matching a pattern
+    /// Search for files matching a pattern with concurrent pattern matching and atomic result collection
     #[instrument(skip(self))]
     pub async fn search_files(&self, pattern: &str, path: Option<&str>) -> ClientResult<Vec<crate::types::FileMetadata>> {
         let _permit = self.concurrency_limiter.acquire().await
             .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        // Atomic counter for tracking results
+        let result_count = Arc::new(AtomicU64::new(0));
+        let error_count = Arc::new(AtomicU64::new(0));
 
         self.retry_policy.execute(|| async {
             let url = format!("{}/search", self.config.server_url());
@@ -914,20 +966,104 @@ impl Client {
             };
             
             let body = serde_json::to_vec(&search_request)
-                .map_err(|e| ClientError::Serialization {
-                    operation: "search_files".to_string(),
-                    error: e.to_string(),
+                .map_err(|e| {
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                    ClientError::Serialization {
+                        operation: "search_files".to_string(),
+                        error: e.to_string(),
+                    }
                 })?;
             
-            let response = self.make_request(Method::POST, &url, Some(Bytes::from(body))).await?;
+            // Make request with compression support headers
+            let mut request = self.http_client.post(&url);
+            request = request.header("Accept-Encoding", "snappy, gzip, deflate");
+            request = request.header("Accept", "application/json, application/octet-stream");
+            request = request.header("Content-Type", "application/json");
+            request = request.body(body);
             
-            let results: Vec<crate::types::FileMetadata> = response.json().await
-                .map_err(|e| ClientError::Deserialization {
+            let response = timeout(
+                self.config.request_timeout(),
+                request.send()
+            ).await
+            .map_err(|_| {
+                error_count.fetch_add(1, Ordering::Relaxed);
+                ClientError::Timeout {
+                    duration: self.config.request_timeout().as_secs(),
                     operation: "search_files".to_string(),
-                    error: e.to_string(),
+                }
+            })?
+            .map_err(|e| {
+                error_count.fetch_add(1, Ordering::Relaxed);
+                ClientError::Network(e)
+            })?;
+
+            if !response.status().is_success() {
+                error_count.fetch_add(1, Ordering::Relaxed);
+                return Err(ClientError::Server {
+                    status: response.status().as_u16(),
+                    message: response.status().canonical_reason()
+                        .unwrap_or("Unknown error").to_string(),
+                });
+            }
+
+            // Check content encoding and handle accordingly
+            let content_encoding = response.headers()
+                .get("content-encoding")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            let content_type = response.headers()
+                .get("content-type")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+
+            let body_bytes = response.bytes().await
+                .map_err(|e| {
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                    ClientError::Network(e)
                 })?;
+
+            let results = if content_encoding == "snappy" && content_type.contains("application/octet-stream") {
+                // Handle Snappy compressed Bitcode data
+                use crate::serialization::deserialize_compressed;
+                use crate::storage_types::StorageFileMetadata;
+                
+                let storage_results = deserialize_compressed::<Vec<StorageFileMetadata>>(&body_bytes)
+                    .map_err(|e| {
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                        e
+                    })?;
+                
+                // Convert storage types to API types with atomic counting
+                storage_results.into_iter()
+                    .map(|storage_meta| {
+                        result_count.fetch_add(1, Ordering::Relaxed);
+                        storage_meta.into()
+                    })
+                    .collect::<Vec<crate::types::FileMetadata>>()
+            } else {
+                // Handle standard JSON response
+                let json_results = serde_json::from_slice::<Vec<crate::types::FileMetadata>>(&body_bytes)
+                    .map_err(|e| {
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                        ClientError::Deserialization {
+                            operation: "search_files".to_string(),
+                            error: e.to_string(),
+                        }
+                    })?;
+                
+                // Update atomic counter
+                result_count.store(json_results.len() as u64, Ordering::Relaxed);
+                json_results
+            };
             
-            debug!("Search completed successfully: {} results for pattern '{}'", results.len(), pattern);
+            let final_count = result_count.load(Ordering::Relaxed);
+            let final_errors = error_count.load(Ordering::Relaxed);
+            
+            debug!("Search completed successfully: {} results for pattern '{}' (encoding: {}, type: {}, errors: {})", 
+                   final_count, pattern, content_encoding, content_type, final_errors);
             Ok(results)
         }).await
     }

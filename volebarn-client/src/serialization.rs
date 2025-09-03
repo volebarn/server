@@ -2,7 +2,6 @@
 //! 
 //! This module provides high-performance serialization using:
 //! - serde_json for API layer (human-readable, interoperable)
-//! - bitcode for local storage layer (651-2,225 MB/s performance)
 //! - Snappy compression for optimal speed/ratio balance
 
 use crate::error::{ClientError, ClientResult};
@@ -40,7 +39,6 @@ pub fn deserialize_storage<T: for<'a> bitcode::Decode<'a>>(data: &[u8]) -> Clien
 
 /// Serialize and compress data for storage using bitcode + Snappy
 /// 
-/// This combination achieves 651-2,225 MB/s pipeline performance:
 /// serialize → compress → decompress → deserialize
 pub fn serialize_compressed<T: bitcode::Encode>(data: &T) -> ClientResult<Vec<u8>> {
     let serialized = serialize_storage(data)?;

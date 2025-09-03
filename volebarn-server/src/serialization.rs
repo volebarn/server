@@ -2,7 +2,7 @@
 //! 
 //! This module provides high-performance serialization using:
 //! - serde_json for API layer (human-readable, interoperable)
-//! - bitcode for RocksDB storage layer (651-2,225 MB/s performance)
+//! - bitcode for RocksDB storage layer
 //! - Snappy compression for optimal speed/ratio balance
 
 use crate::error::{ServerError, ServerResult};

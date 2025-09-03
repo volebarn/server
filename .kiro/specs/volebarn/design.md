@@ -4,7 +4,7 @@
 
 Volebarn consists of three Rust crates implementing a client-server file synchronization architecture. The backend server uses Axum and Tokio for high-performance async HTTP handling with in-memory storage. The client library provides reusable async operations for file management, while the console application monitors local folders and syncs changes with the server.
 
-**Performance Optimization:** Based on comprehensive benchmarks, Volebarn uses Snappy compression with Bitcode serialization for optimal performance. This combination achieves 651-2,225 MB/s complete pipeline throughput (serialize → compress → decompress → deserialize), which is 95-232% faster than traditional Bincode serialization approaches.
+**Performance Optimization:** Based on comprehensive benchmarks, Volebarn uses Snappy compression with Bitcode serialization for optimal performance. 
 
 ## Architecture
 
@@ -630,14 +630,13 @@ struct FileState {
 - ISO 8601 timestamps, hex-encoded hashes for JSON compatibility
 
 **Storage Layer (Internal Persistence):**
-- Use `bitcode` for RocksDB value serialization (651-2,225 MB/s pipeline performance)
+- Use `bitcode` for RocksDB value serialization 
 - Ultra-fast binary format with 5-42x faster serialization/deserialization than bincode
 - Native Rust types (SystemTime, u64) preserved without conversion
 - Zero additional memory overhead compared to bincode
 
 **Compression Strategy:**
 - Use `Snappy` compression for all serialized data requiring compression
-- Optimal balance: 651-2,225 MB/s complete pipeline speed with 2-15x compression ratios
 - Zero additional memory overhead, excellent CPU efficiency (278 MB/s per core)
 - Benchmark results show Snappy+Bitcode dominates all other combinations:
   - File Metadata: 651 MB/s (95% faster than Snappy+Bincode)
