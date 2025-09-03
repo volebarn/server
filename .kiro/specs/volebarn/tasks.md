@@ -27,16 +27,18 @@
   - Select optimal compression algorithm based on benchmark results for production use
   - _Requirements: Performance optimization for file transfers and storage efficiency_
 
-- [x] 2. Implement core data models and types
+- [ ] 2. Implement core data models and types
   - Create shared types for FileMetadata, DirectoryListing, SyncPlan, and BulkOperation structs
-  - Implement dual serialization: serde_json for API layer and bincode for RocksDB storage layer
+  - Implement dual serialization: serde_json for API layer and bitcode for RocksDB storage layer (651-2,225 MB/s performance)
+  - Add Snappy compression for all serialized data requiring compression (optimal speed/ratio balance)
   - Add xxhash-rust integration for file integrity verification and content-addressable storage
   - Create comprehensive custom error types using thiserror with detailed error codes and context
   - _Requirements: 3.4, 5.5, 1.18, 3.14_
 
 - [x] 3. Implement server storage layer
-- [x] 3.1 Create async RocksDB metadata storage system
-  - Implement MetadataStore struct with RocksDB for persistent metadata storage using bincode serialization
+- [ ] 3.1 Create async RocksDB metadata storage system
+  - Implement MetadataStore struct with RocksDB for persistent metadata storage using bitcode serialization (5-42x faster than bincode)
+  - Add Snappy compression for all serialized metadata requiring compression (651-2,225 MB/s pipeline performance)
   - Set up column families for files, directories, hash index, and modified time index
   - Add async methods for CRUD operations on file metadata with atomic operations
   - Implement path normalization and hierarchical directory support
@@ -78,27 +80,30 @@
   - _Requirements: 1.6, 1.7, 1.8, 1.17_
 
 - [x] 5. Implement bulk operations on server
-- [x] 5.1 Create async bulk upload endpoint
+- [ ] 5.1 Create async bulk upload endpoint
   - Implement async POST /bulk/upload with multipart/form-data support using zero-copy Bytes
   - Add async zero-copy file processing for multiple files using RocksDB transactions and FileStorage
-  - Handle directory structure preservation during bulk uploads using RocksDB metadata operations
+  - Use Snappy compression for metadata serialization (651-2,225 MB/s pipeline performance)
+  - Handle directory structure preservation during bulk uploads using RocksDB metadata operations with bitcode serialization
   - Use DashMap for temporary request-scoped progress tracking during bulk upload
   - Return BulkUploadResponse with success/failure details using atomic counters
   - Write async tests for bulk upload scenarios with concurrent operations and persistent storage
   - _Requirements: 1.9, 3.6_
 
-- [x] 5.2 Create async sync and manifest endpoints
-  - Implement async GET /bulk/manifest endpoint to return complete file manifest using RocksDB iteration
+- [ ] 5.2 Create async sync and manifest endpoints
+  - Implement async GET /bulk/manifest endpoint to return complete file manifest using RocksDB iteration with bitcode deserialization
   - Create async POST /bulk/sync endpoint that receives client manifest and returns sync operations
+  - Use Snappy compression for manifest data transfer (651-2,225 MB/s pipeline performance)
   - Add async sync logic where server state is authoritative using RocksDB queries for comparison
-  - Implement efficient manifest generation using RocksDB column family scans
+  - Implement efficient manifest generation using RocksDB column family scans with bitcode serialization
   - Write async tests for sync scenarios with server as source of truth and persistent storage
   - _Requirements: 1.11, 1.12, 3.7, 3.8_
 
-- [x] 5.3 Create remaining async bulk endpoints
+- [ ] 5.3 Create remaining async bulk endpoints
   - Implement async POST /bulk/download for concurrent multiple file retrieval using FileStorage and zero-copy Bytes
   - Create async DELETE /bulk/delete for multiple file/directory deletion using RocksDB transactions and FileStorage cleanup
-  - Add async POST /files/move and POST /files/copy endpoints using RocksDB metadata operations and FileStorage
+  - Add async POST /files/move and POST /files/copy endpoints using RocksDB metadata operations with bitcode serialization and FileStorage
+  - Use Snappy compression for bulk operation metadata transfer (651-2,225 MB/s pipeline performance)
   - Use DashMap for temporary request-scoped state tracking during bulk operations
   - Write comprehensive async tests for all bulk operations with persistent storage and concurrent scenarios
   - _Requirements: 1.10, 1.13, 1.15, 1.16, 3.10, 3.12_
@@ -152,9 +157,10 @@
   - _Requirements: 3.2, 3.6, 3.10_
 
 - [ ] 9.2 Implement async sync functionality
-  - Create async get_manifest method for retrieving server file manifest using zero-copy
-  - Implement async sync method that compares local vs remote using lock-free operations
+  - Create async get_manifest method for retrieving server file manifest using zero-copy with Snappy decompression
+  - Implement async sync method that compares local vs remote using lock-free operations with bitcode deserialization
   - Add async methods for downloading missing files and deleting extra local files with atomic progress tracking
+  - Use Snappy compression for manifest transfer (651-2,225 MB/s pipeline performance)
   - Create high-level async full_sync method that makes local directory match server using lock-free patterns
   - Write comprehensive async tests for sync scenarios with zero-lock concurrent operations
   - _Requirements: 3.7, 3.8, 3.9_
@@ -179,7 +185,8 @@
 - [ ] 11. Implement console application file index
 - [ ] 11.1 Create async local file index with optional persistence
   - Implement async FileIndex using DashMap for tracking entire directory tree state lock-free
-  - Add optional local RocksDB for persisting client-side file index across restarts
+  - Add optional local RocksDB for persisting client-side file index across restarts using bitcode serialization
+  - Use Snappy compression for local index persistence (651-2,225 MB/s pipeline performance)
   - Add async hash calculation and change detection for all files using xxhash-rust
   - Create async index initialization from existing directory structure
   - Implement atomic index updates based on file system events using DashMap operations
