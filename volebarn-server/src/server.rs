@@ -4,7 +4,7 @@
 //! configurable binding, error handling middleware, and health checks.
 
 use crate::{Result, ServerError};
-use crate::handlers::{AppState, upload_file, download_file, update_file, delete_file, get_file_metadata};
+use crate::handlers::{AppState, upload_file, update_file, delete_file, get_file_metadata, list_directory, create_directory, delete_directory, search_files, get_file_or_directory};
 use axum::{
     extract::MatchedPath,
     http::{Request, StatusCode},
@@ -132,12 +132,20 @@ impl Server {
             // Health check endpoint
             .route("/health", get(health_check))
             .route("/", get(root_handler))
+            // Directory listing endpoints
+            .route("/files", get(list_directory))
+            .route("/files/", get(list_directory))
             // Single file operation endpoints
             .route("/files/{*path}", post(upload_file))
-            .route("/files/{*path}", get(download_file))
+            .route("/files/{*path}", get(get_file_or_directory))
             .route("/files/{*path}", put(update_file))
             .route("/files/{*path}", delete(delete_file))
             .route("/files/{*path}", head(get_file_metadata))
+            // Directory operation endpoints
+            .route("/directories/{*path}", post(create_directory))
+            .route("/directories/{*path}", delete(delete_directory))
+            // Search endpoint
+            .route("/search", get(search_files))
             // Add application state
             .with_state(app_state)
             // Add error handling middleware

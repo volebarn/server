@@ -9,15 +9,16 @@
 
 use crate::error::{ServerError, ServerResult};
 use crate::storage::{FileStorage, MetadataStore};
-use crate::types::FileMetadataResponse;
+use crate::types::{FileMetadataResponse, DirectoryListing};
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -245,4 +246,271 @@ pub async fn get_file_metadata(
     info!("File metadata retrieved: {} ({} bytes)", file_path, metadata.size);
     
     Ok((StatusCode::OK, headers).into_response())
+}
+
+/// List directory contents or root directory
+/// GET /files or GET /files/*path
+pub async fn list_directory(
+    path: Option<Path<String>>,
+    State(state): State<AppState>,
+) -> ServerResult<Response> {
+    let dir_path = path.map(|p| p.0).unwrap_or_else(|| "/".to_string());
+    debug!("Listing directory: {}", dir_path);
+    
+    // Validate path
+    if dir_path.is_empty() {
+        return Err(ServerError::InvalidPath {
+            path: dir_path,
+            reason: "Path cannot be empty".to_string(),
+        });
+    }
+    
+    // Check if the path exists and is a directory (if not root)
+    if dir_path != "/" {
+        if let Some(metadata) = state.metadata_store.get_file_metadata(&dir_path).await? {
+            if !metadata.is_directory {
+                return Err(ServerError::InvalidPath {
+                    path: dir_path,
+                    reason: "Path is not a directory".to_string(),
+                });
+            }
+        } else {
+            return Err(ServerError::FileNotFound { path: dir_path });
+        }
+    }
+    
+    // Get directory contents
+    let entries = state.metadata_store.list_directory(&dir_path).await?;
+    
+    info!("Directory listed successfully: {} ({} entries)", dir_path, entries.len());
+    
+    // Convert to response format
+    let response_entries: Vec<FileMetadataResponse> = entries
+        .into_iter()
+        .map(|metadata| metadata.into())
+        .collect();
+    
+    // Use normalized path for consistency (storage layer normalizes paths)
+    let normalized_path = if dir_path == "/" {
+        "/".to_string()
+    } else {
+        let trimmed = dir_path.trim_start_matches('/').trim_end_matches('/');
+        if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", trimmed)
+        }
+    };
+    
+    let listing = DirectoryListing {
+        path: normalized_path,
+        entries: response_entries.into_iter().map(|r| r.try_into()).collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ServerError::Internal {
+                context: format!("Failed to convert directory listing: {}", e),
+            })?,
+    };
+    
+    Ok((StatusCode::OK, Json(listing)).into_response())
+}
+
+/// Create a directory
+/// POST /directories/*path
+pub async fn create_directory(
+    Path(dir_path): Path<String>,
+    State(state): State<AppState>,
+) -> ServerResult<Response> {
+    debug!("Creating directory: {}", dir_path);
+    
+    // Validate path
+    if dir_path.is_empty() {
+        return Err(ServerError::InvalidPath {
+            path: dir_path,
+            reason: "Path cannot be empty".to_string(),
+        });
+    }
+    
+    // Create directory in metadata store
+    state.metadata_store.create_directory(&dir_path).await?;
+    
+    info!("Directory created successfully: {}", dir_path);
+    
+    Ok(StatusCode::CREATED.into_response())
+}
+
+/// Delete a directory recursively
+/// DELETE /directories/*path
+pub async fn delete_directory(
+    Path(dir_path): Path<String>,
+    State(state): State<AppState>,
+) -> ServerResult<Response> {
+    debug!("Deleting directory recursively: {}", dir_path);
+    
+    // Validate path
+    if dir_path.is_empty() {
+        return Err(ServerError::InvalidPath {
+            path: dir_path,
+            reason: "Path cannot be empty".to_string(),
+        });
+    }
+    
+    // Check if directory exists
+    let metadata = state
+        .metadata_store
+        .get_file_metadata(&dir_path)
+        .await?
+        .ok_or_else(|| ServerError::FileNotFound { path: dir_path.clone() })?;
+    
+    if !metadata.is_directory {
+        return Err(ServerError::InvalidPath {
+            path: dir_path,
+            reason: "Path is not a directory".to_string(),
+        });
+    }
+    
+    // Delete directory recursively (this will also delete file content)
+    let deleted_paths = state.metadata_store.delete_directory_recursive(&dir_path).await?;
+    
+    // Delete file content for all deleted files
+    for path in &deleted_paths {
+        if let Ok(Some(file_metadata)) = state.metadata_store.get_file_metadata(path).await {
+            if !file_metadata.is_directory {
+                // Try to delete file content, but don't fail if it's already gone
+                if let Err(e) = state.file_storage.delete_file(path).await {
+                    warn!("Failed to delete file content during directory deletion: {}", e);
+                }
+            }
+        }
+    }
+    
+    info!("Directory deleted successfully: {} ({} items)", dir_path, deleted_paths.len());
+    
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Search for files matching a pattern
+/// GET /search?pattern=<pattern>&path=<path>&recursive=<bool>
+pub async fn search_files(
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> ServerResult<Response> {
+    let pattern = params.get("pattern")
+        .ok_or_else(|| ServerError::InvalidPath {
+            path: "query".to_string(),
+            reason: "Missing 'pattern' query parameter".to_string(),
+        })?;
+    
+    let search_path = params.get("path").cloned().unwrap_or_else(|| "/".to_string());
+    let recursive = params.get("recursive")
+        .map(|s| s.parse::<bool>().unwrap_or(true))
+        .unwrap_or(true);
+    
+    debug!("Searching for files: pattern='{}', path='{}', recursive={}", pattern, search_path, recursive);
+    
+    // Get all files in the search path
+    let all_files = if recursive {
+        // Get all files recursively
+        state.metadata_store.get_all_files_in_directory(&search_path).await
+            .unwrap_or_else(|_| Vec::new())
+    } else {
+        // Get only direct children
+        state.metadata_store.list_directory(&search_path).await
+            .map(|entries| entries.into_iter().map(|e| e.path).collect())
+            .unwrap_or_else(|_| Vec::new())
+    };
+    
+    // Filter files by pattern using glob-style matching
+    let mut matching_files = Vec::new();
+    for file_path in all_files {
+        if let Ok(Some(metadata)) = state.metadata_store.get_file_metadata(&file_path).await {
+            if matches_pattern(&metadata.name, pattern) || matches_pattern(&metadata.path, pattern) {
+                matching_files.push(metadata);
+            }
+        }
+    }
+    
+    // Sort results by path for consistent ordering
+    matching_files.sort_by(|a, b| a.path.cmp(&b.path));
+    
+    info!("Search completed: pattern='{}', found {} matches", pattern, matching_files.len());
+    
+    // Convert to response format
+    let response_files: Vec<FileMetadataResponse> = matching_files
+        .into_iter()
+        .map(|metadata| metadata.into())
+        .collect();
+    
+    Ok((StatusCode::OK, Json(response_files)).into_response())
+}
+
+/// Handle GET requests for files or directories
+/// This function determines whether to download a file or list a directory
+pub async fn get_file_or_directory(
+    Path(path): Path<String>,
+    State(state): State<AppState>,
+) -> ServerResult<Response> {
+    debug!("GET request for path: {}", path);
+    
+    // Check if path exists and determine if it's a file or directory
+    if let Some(metadata) = state.metadata_store.get_file_metadata(&path).await? {
+        if metadata.is_directory {
+            // It's a directory, list its contents
+            list_directory(Some(Path(path)), State(state)).await
+        } else {
+            // It's a file, download it
+            download_file(Path(path), State(state)).await
+        }
+    } else {
+        // Path doesn't exist, return 404
+        Err(ServerError::FileNotFound { path })
+    }
+}
+
+/// Simple glob-style pattern matching
+fn matches_pattern(text: &str, pattern: &str) -> bool {
+    // Simple implementation supporting * and ? wildcards
+    if pattern == "*" {
+        return true;
+    }
+    
+    // Convert glob pattern to regex-like matching
+    let mut pattern_chars = pattern.chars().peekable();
+    let mut text_chars = text.chars().peekable();
+    
+    while let Some(p) = pattern_chars.next() {
+        match p {
+            '*' => {
+                // Match zero or more characters
+                if pattern_chars.peek().is_none() {
+                    // Pattern ends with *, match rest of text
+                    return true;
+                }
+                
+                // Try to match the rest of the pattern at each position
+                let remaining_pattern: String = pattern_chars.collect();
+                while text_chars.peek().is_some() {
+                    let remaining_text: String = text_chars.clone().collect();
+                    if matches_pattern(&remaining_text, &remaining_pattern) {
+                        return true;
+                    }
+                    text_chars.next();
+                }
+                return matches_pattern("", &remaining_pattern);
+            }
+            '?' => {
+                // Match exactly one character
+                if text_chars.next().is_none() {
+                    return false;
+                }
+            }
+            c => {
+                // Match exact character
+                if text_chars.next() != Some(c) {
+                    return false;
+                }
+            }
+        }
+    }
+    
+    // Pattern consumed, text should also be consumed
+    text_chars.peek().is_none()
 }

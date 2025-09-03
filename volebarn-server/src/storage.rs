@@ -464,8 +464,8 @@ impl MetadataStore {
         Ok(deleted_paths)
     }
 
-    /// Get all files in a directory recursively
-    async fn get_all_files_in_directory(&self, path: &str) -> ServerResult<Vec<String>> {
+    /// Get all files in a directory recursively (public method)
+    pub async fn get_all_files_in_directory(&self, path: &str) -> ServerResult<Vec<String>> {
         let cf = self.cf_handle(CF_FILES)?;
         let mut results = Vec::new();
         

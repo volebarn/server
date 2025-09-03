@@ -49,7 +49,7 @@
   - Write integration tests for all single file endpoints with concurrent operations
   - _Requirements: 1.2, 1.3, 1.4, 1.5, 1.14, 1.18_
 
-- [ ] 4.3 Implement async directory operation endpoints
+- [x] 4.3 Implement async directory operation endpoints
   - Create GET /files and GET /files/*path endpoints for directory listing using RocksDB queries
   - Create POST /directories/*path endpoint for directory creation in RocksDB metadata
   - Create DELETE /directories/*path endpoint for recursive directory deletion
