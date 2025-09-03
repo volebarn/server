@@ -166,5 +166,93 @@ impl From<serde_json::Error> for ClientError {
     }
 }
 
+impl Clone for ClientError {
+    fn clone(&self) -> Self {
+        match self {
+            ClientError::Network(e) => ClientError::Connection { 
+                error: e.to_string() 
+            },
+            ClientError::FileNotFound { path } => ClientError::FileNotFound { 
+                path: path.clone() 
+            },
+            ClientError::Server { status, message } => ClientError::Server { 
+                status: *status, 
+                message: message.clone() 
+            },
+            ClientError::HashMismatch { path, expected, actual } => ClientError::HashMismatch {
+                path: path.clone(),
+                expected: expected.clone(),
+                actual: actual.clone(),
+            },
+            ClientError::Tls { error } => ClientError::Tls { 
+                error: error.clone() 
+            },
+            ClientError::TlsHandshake { error } => ClientError::TlsHandshake { 
+                error: error.clone() 
+            },
+            ClientError::Timeout { duration, operation } => ClientError::Timeout {
+                duration: *duration,
+                operation: operation.clone(),
+            },
+            ClientError::RateLimited { retry_after } => ClientError::RateLimited { 
+                retry_after: *retry_after 
+            },
+            ClientError::PartialFailure { successful, failed, errors } => ClientError::PartialFailure {
+                successful: *successful,
+                failed: *failed,
+                errors: errors.clone(),
+            },
+            ClientError::Config { field, error } => ClientError::Config {
+                field: field.clone(),
+                error: error.clone(),
+            },
+            ClientError::Serialization { operation, error } => ClientError::Serialization {
+                operation: operation.clone(),
+                error: error.clone(),
+            },
+            ClientError::Deserialization { operation, error } => ClientError::Deserialization {
+                operation: operation.clone(),
+                error: error.clone(),
+            },
+            ClientError::Io { path, error } => ClientError::Io {
+                path: path.clone(),
+                error: error.clone(),
+            },
+            ClientError::InvalidResponse { error } => ClientError::InvalidResponse { 
+                error: error.clone() 
+            },
+            ClientError::Authentication { error } => ClientError::Authentication { 
+                error: error.clone() 
+            },
+            ClientError::PermissionDenied { path, reason } => ClientError::PermissionDenied {
+                path: path.clone(),
+                reason: reason.clone(),
+            },
+            ClientError::ResourceLimit { resource, limit } => ClientError::ResourceLimit {
+                resource: resource.clone(),
+                limit: limit.clone(),
+            },
+            ClientError::Connection { error } => ClientError::Connection { 
+                error: error.clone() 
+            },
+            ClientError::CircuitBreakerOpen => ClientError::CircuitBreakerOpen,
+            ClientError::RetryLimitExceeded { attempts } => ClientError::RetryLimitExceeded { 
+                attempts: *attempts 
+            },
+            ClientError::InvalidPath { path, reason } => ClientError::InvalidPath {
+                path: path.clone(),
+                reason: reason.clone(),
+            },
+            ClientError::SyncConflict { path } => ClientError::SyncConflict { 
+                path: path.clone() 
+            },
+            ClientError::LocalFile { path, error } => ClientError::LocalFile {
+                path: path.clone(),
+                error: error.clone(),
+            },
+        }
+    }
+}
+
 /// Result type alias for client operations
 pub type ClientResult<T> = Result<T, ClientError>;
