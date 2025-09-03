@@ -99,7 +99,7 @@
   - Write async tests for sync scenarios with server as source of truth and persistent storage
   - _Requirements: 1.11, 1.12, 3.7, 3.8_
 
-- [ ] 5.3 Create remaining async bulk endpoints
+- [x] 5.3 Create remaining async bulk endpoints
   - Implement async POST /bulk/download for concurrent multiple file retrieval using FileStorage and zero-copy Bytes
   - Create async DELETE /bulk/delete for multiple file/directory deletion using RocksDB transactions and FileStorage cleanup
   - Add async POST /files/move and POST /files/copy endpoints using RocksDB metadata operations with bitcode serialization and FileStorage
