@@ -10,7 +10,6 @@ use axum::{
 };
 use serde_json::json;
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
 
 /// Test the server configuration
 #[cfg(test)]
@@ -43,11 +42,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_creation() {
+        use tempfile::TempDir;
+        
+        let temp_dir = TempDir::new().unwrap();
         let config = ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0, // Use port 0 to get any available port
             max_request_size: 1024,
             request_timeout: 10,
+            storage_root: temp_dir.path().to_path_buf(),
         };
         
         let server = Server::with_config(config).await.unwrap();

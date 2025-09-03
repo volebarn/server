@@ -40,7 +40,7 @@
   - Create health check endpoint for testing
   - _Requirements: 1.1, 4.1, 5.1_
 
-- [ ] 4.2 Implement async single file operation endpoints
+- [x] 4.2 Implement async single file operation endpoints
   - Create POST /files/*path endpoint for file uploads with RocksDB metadata and file system storage
   - Create GET /files/*path endpoint for file downloads with zero-copy Bytes streaming
   - Create PUT /files/*path endpoint for atomic file updates using temp files

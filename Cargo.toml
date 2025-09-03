@@ -14,6 +14,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 # HTTP server and client
 axum = { version = "0.8", features = ["multipart"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
+tower = { version = "0.5", features = ["util"] }
 
 # Storage and data structures
 rocksdb = "0.24"

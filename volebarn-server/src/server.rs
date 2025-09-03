@@ -4,16 +4,17 @@
 //! configurable binding, error handling middleware, and health checks.
 
 use crate::{Result, ServerError};
+use crate::handlers::{AppState, upload_file, download_file, update_file, delete_file, get_file_metadata};
 use axum::{
     extract::MatchedPath,
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post, put, delete, head},
     Json, Router,
 };
 use serde_json::json;
-use std::{net::SocketAddr, sync::atomic::{AtomicU64, Ordering}, time::Instant};
+use std::{net::SocketAddr, path::PathBuf, sync::atomic::{AtomicU64, Ordering}, time::Instant};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -28,6 +29,8 @@ pub struct ServerConfig {
     pub max_request_size: usize,
     /// Request timeout in seconds
     pub request_timeout: u64,
+    /// Storage root directory
+    pub storage_root: PathBuf,
 }
 
 impl Default for ServerConfig {
@@ -37,6 +40,7 @@ impl Default for ServerConfig {
             port: 8080,
             max_request_size: 100 * 1024 * 1024, // 100MB
             request_timeout: 30,
+            storage_root: PathBuf::from("./storage"),
         }
     }
 }
@@ -69,11 +73,16 @@ impl ServerConfig {
                 error: format!("Invalid request timeout: {}", e),
             })?;
 
+        let storage_root = std::env::var("VOLEBARN_STORAGE_ROOT")
+            .unwrap_or_else(|_| "./storage".to_string())
+            .into();
+
         Ok(Self {
             host,
             port,
             max_request_size,
             request_timeout,
+            storage_root,
         })
     }
     
@@ -106,7 +115,9 @@ impl Server {
     pub async fn with_config(config: ServerConfig) -> Result<Self> {
         info!("Initializing server with config: {:?}", config);
         
-        let app = Self::create_app();
+        // Initialize application state with storage
+        let app_state = AppState::new(&config.storage_root).await?;
+        let app = Self::create_app(app_state);
         
         Ok(Self {
             config,
@@ -116,11 +127,19 @@ impl Server {
     }
     
     /// Create the Axum application with routing and middleware
-    fn create_app() -> Router {
+    fn create_app(app_state: AppState) -> Router {
         Router::new()
             // Health check endpoint
             .route("/health", get(health_check))
             .route("/", get(root_handler))
+            // Single file operation endpoints
+            .route("/files/{*path}", post(upload_file))
+            .route("/files/{*path}", get(download_file))
+            .route("/files/{*path}", put(update_file))
+            .route("/files/{*path}", delete(delete_file))
+            .route("/files/{*path}", head(get_file_metadata))
+            // Add application state
+            .with_state(app_state)
             // Add error handling middleware
             .layer(middleware::from_fn(error_handling_middleware))
             // Add request logging middleware
