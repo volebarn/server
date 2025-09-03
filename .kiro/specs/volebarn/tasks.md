@@ -101,7 +101,7 @@
   - Write async unit tests for client initialization, configuration, and error scenarios
   - _Requirements: 3.3, 3.15, 2.14_
 
-- [ ] 7.2 Add async client-side hash verification
+- [x] 7.2 Add async client-side hash verification
   - Implement async client-side HashManager for xxHash3 calculation using zero-copy Bytes
   - Add async file integrity verification methods with lock-free operations
   - Create async hash mismatch error handling and reporting using atomic error counters
