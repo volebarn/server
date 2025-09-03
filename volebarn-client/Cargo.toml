@@ -29,3 +29,4 @@ tokio-test = { workspace = true }
 tempfile = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
+futures = { workspace = true }

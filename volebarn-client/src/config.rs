@@ -7,13 +7,12 @@ use crate::error::ClientError;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 
 /// Client configuration with atomic state management
 #[derive(Debug)]
 pub struct Config {
-    /// Server base URL (e.g., "https://localhost:8080")
-    pub server_url: Arc<RwLock<String>>,
+    /// Server base URL (e.g., "https://localhost:8080") - stored as Arc<String> for lock-free access
+    pub server_url: Arc<String>,
     
     /// Connection timeout in seconds
     pub connect_timeout: AtomicU64,
@@ -74,7 +73,7 @@ impl Config {
     /// Create a new configuration with default values
     pub fn new(server_url: String) -> Self {
         Self {
-            server_url: Arc::new(RwLock::new(server_url)),
+            server_url: Arc::new(server_url),
             connect_timeout: AtomicU64::new(30),
             request_timeout: AtomicU64::new(300),
             max_retries: AtomicU32::new(5),
@@ -97,12 +96,12 @@ impl Config {
     }
 
     /// Get server URL
-    pub async fn server_url(&self) -> String {
-        self.server_url.read().await.clone()
+    pub fn server_url(&self) -> String {
+        (*self.server_url).clone()
     }
 
-    /// Set server URL
-    pub async fn set_server_url(&self, url: String) -> Result<(), ClientError> {
+    /// Set server URL - creates a new Config instance for lock-free operation
+    pub fn with_server_url(&self, url: String) -> Result<Self, ClientError> {
         if url.is_empty() {
             return Err(ClientError::Config {
                 field: "server_url".to_string(),
@@ -118,8 +117,9 @@ impl Config {
             });
         }
         
-        *self.server_url.write().await = url;
-        Ok(())
+        let mut new_config = self.clone();
+        new_config.server_url = Arc::new(url);
+        Ok(new_config)
     }
 
     /// Get connect timeout as Duration
@@ -303,7 +303,7 @@ impl Config {
     }
 
     /// Create configuration from environment variables
-    pub async fn from_env() -> Result<Self, ClientError> {
+    pub fn from_env() -> Result<Self, ClientError> {
         let server_url = std::env::var("VOLEBARN_SERVER_URL")
             .unwrap_or_else(|_| "https://localhost:8080".to_string());
 
@@ -342,8 +342,8 @@ impl Config {
     }
 
     /// Validate configuration
-    pub async fn validate(&self) -> Result<(), ClientError> {
-        let url = self.server_url().await;
+    pub fn validate(&self) -> Result<(), ClientError> {
+        let url = self.server_url();
         if url.is_empty() {
             return Err(ClientError::Config {
                 field: "server_url".to_string(),
@@ -379,13 +379,7 @@ impl Config {
 impl Clone for Config {
     fn clone(&self) -> Self {
         Self {
-            server_url: Arc::new(RwLock::new(
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        self.server_url.read().await.clone()
-                    })
-                })
-            )),
+            server_url: self.server_url.clone(),
             connect_timeout: AtomicU64::new(self.connect_timeout.load(Ordering::Relaxed)),
             request_timeout: AtomicU64::new(self.request_timeout.load(Ordering::Relaxed)),
             max_retries: AtomicU32::new(self.max_retries.load(Ordering::Relaxed)),
