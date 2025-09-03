@@ -80,7 +80,7 @@
   - _Requirements: 1.6, 1.7, 1.8, 1.17_
 
 - [x] 5. Implement bulk operations on server
-- [ ] 5.1 Create async bulk upload endpoint
+- [x] 5.1 Create async bulk upload endpoint
   - Implement async POST /bulk/upload with multipart/form-data support using zero-copy Bytes
   - Add async zero-copy file processing for multiple files using RocksDB transactions and FileStorage
   - Use Snappy compression for metadata serialization 
@@ -90,7 +90,7 @@
   - Write async tests for bulk upload scenarios with concurrent operations and persistent storage
   - _Requirements: 1.9, 3.6_
 
-- [ ] 5.2 Create async sync and manifest endpoints
+- [x] 5.2 Create async sync and manifest endpoints
   - Implement async GET /bulk/manifest endpoint to return complete file manifest using RocksDB iteration with bitcode deserialization
   - Create async POST /bulk/sync endpoint that receives client manifest and returns sync operations
   - Use Snappy compression for manifest data transfer
