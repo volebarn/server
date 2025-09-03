@@ -4,7 +4,7 @@
 //! configurable binding, error handling middleware, and health checks.
 
 use crate::{Result, ServerError};
-use crate::handlers::{AppState, upload_file, update_file, delete_file, get_file_metadata, list_directory, create_directory, delete_directory, search_files, get_file_or_directory, bulk_upload, get_manifest, sync_with_manifest};
+use crate::handlers::{AppState, upload_file, update_file, delete_file, get_file_metadata, list_directory, create_directory, delete_directory, search_files, get_file_or_directory, bulk_upload, get_manifest, sync_with_manifest, bulk_download, bulk_delete, move_file_or_directory, copy_file_or_directory};
 use axum::{
     extract::MatchedPath,
     http::{Request, StatusCode},
@@ -146,8 +146,13 @@ impl Server {
             .route("/directories/{*path}", delete(delete_directory))
             // Bulk operation endpoints
             .route("/bulk/upload", post(bulk_upload))
+            .route("/bulk/download", post(bulk_download))
+            .route("/bulk/delete", delete(bulk_delete))
             .route("/bulk/manifest", get(get_manifest))
             .route("/bulk/sync", post(sync_with_manifest))
+            // File/directory move and copy endpoints
+            .route("/files/move", post(move_file_or_directory))
+            .route("/files/copy", post(copy_file_or_directory))
             // Search endpoint
             .route("/search", get(search_files))
             // Add application state
@@ -218,8 +223,12 @@ async fn root_handler() -> impl IntoResponse {
             "files": "/files/*path",
             "directories": "/directories/*path",
             "bulk_upload": "/bulk/upload",
+            "bulk_download": "/bulk/download",
+            "bulk_delete": "/bulk/delete",
             "bulk_manifest": "/bulk/manifest",
             "bulk_sync": "/bulk/sync",
+            "move": "/files/move",
+            "copy": "/files/copy",
             "search": "/search"
         }
     });

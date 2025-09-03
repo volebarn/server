@@ -22,6 +22,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use std::time::SystemTime;
 use tracing::{debug, info, warn, error};
 
 /// Progress tracking for bulk upload operations
@@ -979,4 +980,511 @@ fn matches_pattern(text: &str, pattern: &str) -> bool {
     
     // Pattern consumed, text should also be consumed
     text_chars.peek().is_none()
+}
+
+/// Bulk download multiple files using concurrent retrieval and zero-copy Bytes
+/// POST /bulk/download
+pub async fn bulk_download(
+    State(state): State<AppState>,
+    Json(request): Json<crate::types::BulkDownloadRequest>,
+) -> ServerResult<Response> {
+    use uuid::Uuid;
+    
+    let request_id = Uuid::new_v4().to_string();
+    debug!("Starting bulk download with request ID: {} for {} files", request_id, request.paths.len());
+    
+    if request.paths.is_empty() {
+        return Err(ServerError::InvalidPath {
+            path: "bulk_download".to_string(),
+            reason: "No paths provided for download".to_string(),
+        });
+    }
+    
+    // Create progress tracker for this request
+    let progress = Arc::new(BulkUploadProgress::new()); // Reuse progress structure
+    state.bulk_progress.insert(request_id.clone(), progress.clone());
+    progress.total_files.store(request.paths.len(), Ordering::Relaxed);
+    
+    // Process downloads concurrently with controlled parallelism
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::pin::Pin;
+    use std::future::Future;
+    
+    type DownloadFuture = Pin<Box<dyn Future<Output = Result<crate::types::FileDownloadResponse, OperationError>> + Send>>;
+    let mut download_futures: FuturesUnordered<DownloadFuture> = FuturesUnordered::new();
+    const MAX_CONCURRENT_DOWNLOADS: usize = 10;
+    
+    let mut path_iter = request.paths.into_iter();
+    let mut successful_downloads = Vec::new();
+    let mut failed_operations = Vec::new();
+    
+    // Start initial batch of downloads
+    for _ in 0..MAX_CONCURRENT_DOWNLOADS {
+        if let Some(path) = path_iter.next() {
+            let state_clone = state.clone();
+            let progress_clone = progress.clone();
+            
+            let future: DownloadFuture = Box::pin(async move {
+                process_single_download(state_clone, path, progress_clone).await
+            });
+            download_futures.push(future);
+        }
+    }
+    
+    // Process downloads as they complete and start new ones
+    while let Some(result) = download_futures.next().await {
+        match result {
+            Ok(file_download) => {
+                successful_downloads.push(file_download);
+                progress.successful_files.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                failed_operations.push(error);
+                progress.failed_files.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        
+        progress.processed_files.fetch_add(1, Ordering::Relaxed);
+        
+        // Start next download if available
+        if let Some(path) = path_iter.next() {
+            let state_clone = state.clone();
+            let progress_clone = progress.clone();
+            
+            let future: DownloadFuture = Box::pin(async move {
+                process_single_download(state_clone, path, progress_clone).await
+            });
+            download_futures.push(future);
+        }
+    }
+    
+    // Clean up progress tracker
+    state.bulk_progress.remove(&request_id);
+    
+    let response = crate::types::BulkDownloadResponse {
+        files: successful_downloads,
+    };
+    
+    info!(
+        "Bulk download completed: {} successful, {} failed",
+        response.files.len(),
+        failed_operations.len()
+    );
+    
+    // If there were failures, include them in the response
+    if !failed_operations.is_empty() {
+        // For now, we'll log the failures but still return successful downloads
+        for error in &failed_operations {
+            warn!("Download failed for {}: {}", error.path, error.error);
+        }
+    }
+    
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Process a single file download within a bulk operation
+async fn process_single_download(
+    state: AppState,
+    path: String,
+    progress: Arc<BulkUploadProgress>,
+) -> Result<crate::types::FileDownloadResponse, OperationError> {
+    debug!("Processing download for: {}", path);
+    
+    // Get file metadata first
+    let metadata = match state.metadata_store.get_file_metadata(&path).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => {
+            return Err(OperationError {
+                path: path.clone(),
+                error: "File not found".to_string(),
+                error_code: ErrorCode::FileNotFound,
+            });
+        }
+        Err(e) => {
+            return Err(OperationError {
+                path: path.clone(),
+                error: e.to_string(),
+                error_code: e.error_code(),
+            });
+        }
+    };
+    
+    // Check if it's a directory
+    if metadata.is_directory {
+        return Err(OperationError {
+            path: path.clone(),
+            error: "Cannot download a directory".to_string(),
+            error_code: ErrorCode::InvalidPath,
+        });
+    }
+    
+    // Retrieve file content
+    match state.file_storage.retrieve_file(&path).await {
+        Ok(content) => {
+            let content_size = content.len() as u64;
+            progress.processed_bytes.fetch_add(content_size, Ordering::Relaxed);
+            
+            // Convert to base64 for JSON transport
+            use base64::{Engine as _, engine::general_purpose};
+            let content_base64 = general_purpose::STANDARD.encode(&content);
+            
+            debug!("Successfully downloaded: {} ({} bytes)", path, content_size);
+            Ok(crate::types::FileDownloadResponse {
+                path,
+                content: content_base64,
+                hash: format!("{:016x}", metadata.xxhash3),
+            })
+        }
+        Err(e) => {
+            error!("Failed to download {}: {}", path, e);
+            Err(OperationError {
+                path: path.clone(),
+                error: e.to_string(),
+                error_code: e.error_code(),
+            })
+        }
+    }
+}
+
+/// Bulk delete multiple files and directories using RocksDB transactions and FileStorage cleanup
+/// DELETE /bulk/delete
+pub async fn bulk_delete(
+    State(state): State<AppState>,
+    Json(request): Json<crate::types::BulkDeleteRequest>,
+) -> ServerResult<Response> {
+    use uuid::Uuid;
+    
+    let request_id = Uuid::new_v4().to_string();
+    debug!("Starting bulk delete with request ID: {} for {} paths", request_id, request.paths.len());
+    
+    if request.paths.is_empty() {
+        return Err(ServerError::InvalidPath {
+            path: "bulk_delete".to_string(),
+            reason: "No paths provided for deletion".to_string(),
+        });
+    }
+    
+    // Create progress tracker for this request
+    let progress = Arc::new(BulkUploadProgress::new());
+    state.bulk_progress.insert(request_id.clone(), progress.clone());
+    progress.total_files.store(request.paths.len(), Ordering::Relaxed);
+    
+    // Process deletions concurrently with controlled parallelism
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::pin::Pin;
+    use std::future::Future;
+    
+    type DeleteFuture = Pin<Box<dyn Future<Output = Result<String, OperationError>> + Send>>;
+    let mut delete_futures: FuturesUnordered<DeleteFuture> = FuturesUnordered::new();
+    const MAX_CONCURRENT_DELETES: usize = 10;
+    
+    let mut path_iter = request.paths.into_iter();
+    let mut successful_deletes = Vec::new();
+    let mut failed_operations = Vec::new();
+    
+    // Start initial batch of deletions
+    for _ in 0..MAX_CONCURRENT_DELETES {
+        if let Some(path) = path_iter.next() {
+            let state_clone = state.clone();
+            let progress_clone = progress.clone();
+            
+            let future: DeleteFuture = Box::pin(async move {
+                process_single_delete(state_clone, path, progress_clone).await
+            });
+            delete_futures.push(future);
+        }
+    }
+    
+    // Process deletions as they complete and start new ones
+    while let Some(result) = delete_futures.next().await {
+        match result {
+            Ok(path) => {
+                successful_deletes.push(path);
+                progress.successful_files.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                failed_operations.push(error);
+                progress.failed_files.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        
+        progress.processed_files.fetch_add(1, Ordering::Relaxed);
+        
+        // Start next deletion if available
+        if let Some(path) = path_iter.next() {
+            let state_clone = state.clone();
+            let progress_clone = progress.clone();
+            
+            let future: DeleteFuture = Box::pin(async move {
+                process_single_delete(state_clone, path, progress_clone).await
+            });
+            delete_futures.push(future);
+        }
+    }
+    
+    // Clean up progress tracker
+    state.bulk_progress.remove(&request_id);
+    
+    let response = crate::types::BulkDeleteResponse {
+        success: successful_deletes,
+        failed: failed_operations,
+    };
+    
+    info!(
+        "Bulk delete completed: {} successful, {} failed",
+        response.success.len(),
+        response.failed.len()
+    );
+    
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Process a single file/directory deletion within a bulk operation
+async fn process_single_delete(
+    state: AppState,
+    path: String,
+    _progress: Arc<BulkUploadProgress>,
+) -> Result<String, OperationError> {
+    debug!("Processing delete for: {}", path);
+    
+    // Get metadata to determine if it's a file or directory
+    let metadata = match state.metadata_store.get_file_metadata(&path).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => {
+            return Err(OperationError {
+                path: path.clone(),
+                error: "File or directory not found".to_string(),
+                error_code: ErrorCode::FileNotFound,
+            });
+        }
+        Err(e) => {
+            return Err(OperationError {
+                path: path.clone(),
+                error: e.to_string(),
+                error_code: e.error_code(),
+            });
+        }
+    };
+    
+    if metadata.is_directory {
+        // Delete directory recursively
+        match state.metadata_store.delete_directory_recursive(&path).await {
+            Ok(deleted_paths) => {
+                // Delete file content for all deleted files
+                for deleted_path in &deleted_paths {
+                    if let Ok(Some(file_metadata)) = state.metadata_store.get_file_metadata(deleted_path).await {
+                        if !file_metadata.is_directory {
+                            // Try to delete file content, but don't fail if it's already gone
+                            if let Err(e) = state.file_storage.delete_file(deleted_path).await {
+                                warn!("Failed to delete file content during bulk directory deletion: {}", e);
+                            }
+                        }
+                    }
+                }
+                debug!("Successfully deleted directory: {} ({} items)", path, deleted_paths.len());
+                Ok(path)
+            }
+            Err(e) => {
+                error!("Failed to delete directory {}: {}", path, e);
+                Err(OperationError {
+                    path: path.clone(),
+                    error: e.to_string(),
+                    error_code: e.error_code(),
+                })
+            }
+        }
+    } else {
+        // Delete single file
+        match state.file_storage.delete_file(&path).await {
+            Ok(true) => {
+                debug!("Successfully deleted file: {}", path);
+                Ok(path)
+            }
+            Ok(false) => {
+                // File didn't exist, but that's not necessarily an error for bulk operations
+                debug!("File not found during delete: {}", path);
+                Ok(path)
+            }
+            Err(e) => {
+                error!("Failed to delete file {}: {}", path, e);
+                Err(OperationError {
+                    path: path.clone(),
+                    error: e.to_string(),
+                    error_code: e.error_code(),
+                })
+            }
+        }
+    }
+}
+
+/// Move a file or directory to a new location
+/// POST /files/move
+pub async fn move_file_or_directory(
+    State(state): State<AppState>,
+    Json(request): Json<crate::types::MoveRequest>,
+) -> ServerResult<Response> {
+    debug!("Moving {} to {}", request.from_path, request.to_path);
+    
+    // Validate paths
+    if request.from_path.is_empty() || request.to_path.is_empty() {
+        return Err(ServerError::InvalidPath {
+            path: "move_request".to_string(),
+            reason: "Source and destination paths cannot be empty".to_string(),
+        });
+    }
+    
+    if request.from_path == request.to_path {
+        return Err(ServerError::InvalidPath {
+            path: request.from_path,
+            reason: "Source and destination paths cannot be the same".to_string(),
+        });
+    }
+    
+    // Check if source exists
+    let source_metadata = state
+        .metadata_store
+        .get_file_metadata(&request.from_path)
+        .await?
+        .ok_or_else(|| ServerError::FileNotFound { path: request.from_path.clone() })?;
+    
+    // Check if destination already exists
+    if state.metadata_store.get_file_metadata(&request.to_path).await?.is_some() {
+        return Err(ServerError::FileAlreadyExists { path: request.to_path });
+    }
+    
+    // Ensure parent directories exist for destination
+    if let Some(parent_path) = get_parent_directory(&request.to_path) {
+        ensure_parent_directories_exist(&state, &parent_path).await?;
+    }
+    
+    if source_metadata.is_directory {
+        // Move directory: get all files in the directory and update their paths
+        let files_in_dir = state.metadata_store.get_all_files_in_directory(&request.from_path).await?;
+        
+        // Create new directory at destination
+        state.metadata_store.create_directory(&request.to_path).await?;
+        
+        // Move all files in the directory
+        for file_path in files_in_dir {
+            let relative_path = file_path.strip_prefix(&format!("{}/", request.from_path))
+                .unwrap_or(&file_path);
+            let new_file_path = format!("{}/{}", request.to_path, relative_path);
+            
+            if let Ok(Some(file_metadata)) = state.metadata_store.get_file_metadata(&file_path).await {
+                // Create new metadata with updated path
+                let mut new_metadata = file_metadata.clone();
+                new_metadata.path = new_file_path.clone();
+                new_metadata.name = std::path::Path::new(&new_file_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&new_file_path)
+                    .to_string();
+                
+                // Store new metadata
+                state.metadata_store.put_file_metadata(&new_metadata).await?;
+                
+                // Delete old metadata
+                state.metadata_store.delete_file_metadata(&file_path).await?;
+            }
+        }
+        
+        // Delete source directory
+        state.metadata_store.delete_directory_recursive(&request.from_path).await?;
+        
+    } else {
+        // Move single file: update metadata with new path, file content stays the same
+        let mut new_metadata = source_metadata.clone();
+        new_metadata.path = request.to_path.clone();
+        new_metadata.name = std::path::Path::new(&request.to_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&request.to_path)
+            .to_string();
+        new_metadata.modified = SystemTime::now();
+        
+        // Store new metadata
+        state.metadata_store.put_file_metadata(&new_metadata).await?;
+        
+        // Delete old metadata
+        state.metadata_store.delete_file_metadata(&request.from_path).await?;
+    }
+    
+    info!("Successfully moved {} to {}", request.from_path, request.to_path);
+    
+    Ok(StatusCode::OK.into_response())
+}
+
+/// Copy a file or directory to a new location
+/// POST /files/copy
+pub async fn copy_file_or_directory(
+    State(state): State<AppState>,
+    Json(request): Json<crate::types::CopyRequest>,
+) -> ServerResult<Response> {
+    debug!("Copying {} to {}", request.from_path, request.to_path);
+    
+    // Validate paths
+    if request.from_path.is_empty() || request.to_path.is_empty() {
+        return Err(ServerError::InvalidPath {
+            path: "copy_request".to_string(),
+            reason: "Source and destination paths cannot be empty".to_string(),
+        });
+    }
+    
+    if request.from_path == request.to_path {
+        return Err(ServerError::InvalidPath {
+            path: request.from_path,
+            reason: "Source and destination paths cannot be the same".to_string(),
+        });
+    }
+    
+    // Check if source exists
+    let source_metadata = state
+        .metadata_store
+        .get_file_metadata(&request.from_path)
+        .await?
+        .ok_or_else(|| ServerError::FileNotFound { path: request.from_path.clone() })?;
+    
+    // Check if destination already exists
+    if state.metadata_store.get_file_metadata(&request.to_path).await?.is_some() {
+        return Err(ServerError::FileAlreadyExists { path: request.to_path });
+    }
+    
+    // Ensure parent directories exist for destination
+    if let Some(parent_path) = get_parent_directory(&request.to_path) {
+        ensure_parent_directories_exist(&state, &parent_path).await?;
+    }
+    
+    if source_metadata.is_directory {
+        // Copy directory: create new directory and copy all files
+        state.metadata_store.create_directory(&request.to_path).await?;
+        
+        let files_in_dir = state.metadata_store.get_all_files_in_directory(&request.from_path).await?;
+        
+        // Copy all files in the directory
+        for file_path in files_in_dir {
+            let relative_path = file_path.strip_prefix(&format!("{}/", request.from_path))
+                .unwrap_or(&file_path);
+            let new_file_path = format!("{}/{}", request.to_path, relative_path);
+            
+            if let Ok(Some(file_metadata)) = state.metadata_store.get_file_metadata(&file_path).await {
+                if file_metadata.is_directory {
+                    // Create subdirectory
+                    state.metadata_store.create_directory(&new_file_path).await?;
+                } else {
+                    // Copy file content and create new metadata
+                    let content = state.file_storage.retrieve_file(&file_path).await?;
+                    state.file_storage.store_file(&new_file_path, content).await?;
+                }
+            }
+        }
+        
+    } else {
+        // Copy single file: retrieve content and store with new path
+        let content = state.file_storage.retrieve_file(&request.from_path).await?;
+        state.file_storage.store_file(&request.to_path, content).await?;
+    }
+    
+    info!("Successfully copied {} to {}", request.from_path, request.to_path);
+    
+    Ok(StatusCode::CREATED.into_response())
 }

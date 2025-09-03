@@ -23,6 +23,7 @@ uuid = { workspace = true }
 crossbeam = { workspace = true }
 chrono = { workspace = true }
 futures = "0.3"
+base64 = "0.21"
 
 [dev-dependencies]
 tokio-test = { workspace = true }
