@@ -59,11 +59,18 @@ pub struct FileUpload {
     pub content: Bytes,
 }
 
-/// Complete file manifest with checksums
+/// Complete file manifest with checksums (internal format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileManifest {
     /// Map of file path to metadata
     pub files: HashMap<String, FileMetadata>,
+}
+
+/// Complete file manifest for API responses (JSON-friendly)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileManifestResponse {
+    /// Map of file path to metadata
+    pub files: HashMap<String, FileMetadataResponse>,
 }
 
 /// Sync plan describing operations needed to synchronize client with server
@@ -182,11 +189,20 @@ pub enum ErrorCode {
     ConfigError,
 }
 
-/// Request types for various operations
+/// Request types for various operations (internal format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRequest {
     /// Client's current file manifest
     pub client_manifest: FileManifest,
+    /// How to resolve conflicts
+    pub conflict_resolution: ConflictResolutionStrategy,
+}
+
+/// Sync request for API (JSON-friendly format)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncRequestApi {
+    /// Client's current file manifest
+    pub client_manifest: FileManifestResponse,
     /// How to resolve conflicts
     pub conflict_resolution: ConflictResolutionStrategy,
 }
@@ -458,5 +474,26 @@ impl SyncResult {
 impl Default for SyncResult {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Convert API sync request to internal format
+impl TryFrom<SyncRequestApi> for SyncRequest {
+    type Error = crate::error::ServerError;
+    
+    fn try_from(api_request: SyncRequestApi) -> Result<Self, Self::Error> {
+        let mut files = HashMap::new();
+        
+        for (path, response_metadata) in api_request.client_manifest.files {
+            let metadata: FileMetadata = response_metadata.try_into()?;
+            files.insert(path, metadata);
+        }
+        
+        let client_manifest = FileManifest { files };
+        
+        Ok(Self {
+            client_manifest,
+            conflict_resolution: api_request.conflict_resolution,
+        })
     }
 }

@@ -67,7 +67,7 @@
   - Write async tests for bulk upload scenarios with concurrent operations and persistent storage
   - _Requirements: 1.9, 3.6_
 
-- [ ] 5.2 Create async sync and manifest endpoints
+- [x] 5.2 Create async sync and manifest endpoints
   - Implement async GET /bulk/manifest endpoint to return complete file manifest using RocksDB iteration
   - Create async POST /bulk/sync endpoint that receives client manifest and returns sync operations
   - Add async sync logic where server state is authoritative using RocksDB queries for comparison

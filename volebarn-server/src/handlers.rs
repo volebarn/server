@@ -10,7 +10,7 @@
 
 use crate::error::{ServerError, ServerResult};
 use crate::storage::{FileStorage, MetadataStore};
-use crate::types::{FileMetadataResponse, DirectoryListing, BulkUploadResponse, OperationError, ErrorCode, FileUpload};
+use crate::types::{FileMetadata, FileMetadataResponse, DirectoryListing, BulkUploadResponse, OperationError, ErrorCode, FileUpload, FileManifestResponse, SyncRequest, SyncRequestApi, SyncPlan, SyncConflict, ConflictResolution, ConflictResolutionStrategy};
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, State},
@@ -756,7 +756,182 @@ async fn ensure_parent_directories_exist(
     Ok(())
 }
 
-/// Simple glob-style pattern matching
+/// Get complete file manifest from server
+/// GET /bulk/manifest
+pub async fn get_manifest(
+    State(state): State<AppState>,
+) -> ServerResult<Response> {
+    debug!("Getting complete file manifest");
+    
+    // Get all files from metadata store using RocksDB iteration
+    let all_files = get_all_files_from_metadata(&state).await?;
+    
+    // Convert to API-friendly manifest format
+    let mut files = std::collections::HashMap::new();
+    for metadata in all_files {
+        let response_metadata: FileMetadataResponse = metadata.clone().into();
+        files.insert(metadata.path.clone(), response_metadata);
+    }
+    
+    let manifest = FileManifestResponse { files };
+    
+    info!("File manifest generated: {} files", manifest.files.len());
+    
+    Ok((StatusCode::OK, Json(manifest)).into_response())
+}
+
+/// Compare client manifest with server and return sync operations
+/// POST /bulk/sync
+pub async fn sync_with_manifest(
+    State(state): State<AppState>,
+    Json(api_sync_request): Json<SyncRequestApi>,
+) -> ServerResult<Response> {
+    debug!("Processing sync request with {} client files", api_sync_request.client_manifest.files.len());
+    
+    // Convert API request to internal format
+    let sync_request: SyncRequest = api_sync_request.try_into().map_err(|e| {
+        crate::error::ServerError::InvalidRequest {
+            field: "sync_request".to_string(),
+            error: format!("Failed to convert sync request: {}", e),
+        }
+    })?;
+    
+    // Get server manifest
+    let server_files = get_all_files_from_metadata(&state).await?;
+    let mut server_manifest = std::collections::HashMap::new();
+    for metadata in server_files {
+        server_manifest.insert(metadata.path.clone(), metadata);
+    }
+    
+    // Generate sync plan where server is authoritative
+    let sync_plan = generate_sync_plan(
+        &sync_request.client_manifest.files,
+        &server_manifest,
+        &sync_request.conflict_resolution,
+    ).await?;
+    
+    info!(
+        "Sync plan generated: {} uploads, {} downloads, {} deletes, {} conflicts",
+        sync_plan.client_upload.len(),
+        sync_plan.client_download.len(),
+        sync_plan.client_delete.len(),
+        sync_plan.conflicts.len()
+    );
+    
+    Ok((StatusCode::OK, Json(sync_plan)).into_response())
+}
+
+/// Get all files from metadata store using efficient RocksDB iteration
+async fn get_all_files_from_metadata(state: &AppState) -> ServerResult<Vec<FileMetadata>> {
+    
+    // Use the metadata store's efficient iteration method
+    let all_file_paths = state.metadata_store.get_all_files_in_directory("/").await?;
+    let mut all_files = Vec::new();
+    
+    // Get metadata for each file
+    for path in all_file_paths {
+        if let Some(metadata) = state.metadata_store.get_file_metadata(&path).await? {
+            all_files.push(metadata);
+        }
+    }
+    
+    // Also include root directory files that might not be captured by get_all_files_in_directory
+    let root_files = state.metadata_store.list_directory("/").await?;
+    for metadata in root_files {
+        // Only add if not already in the list (avoid duplicates)
+        if !all_files.iter().any(|f| f.path == metadata.path) {
+            all_files.push(metadata);
+        }
+    }
+    
+    Ok(all_files)
+}
+
+/// Generate sync plan where server state is authoritative
+async fn generate_sync_plan(
+    client_files: &std::collections::HashMap<String, FileMetadata>,
+    server_files: &std::collections::HashMap<String, FileMetadata>,
+    conflict_resolution: &ConflictResolutionStrategy,
+) -> ServerResult<SyncPlan> {
+    let mut sync_plan = SyncPlan::new();
+    
+    // Find files that exist on server but not on client (client should download)
+    for (server_path, server_metadata) in server_files {
+        if let Some(client_metadata) = client_files.get(server_path) {
+            // File exists on both sides, check for conflicts
+            if server_metadata.xxhash3 != client_metadata.xxhash3 {
+                // Hash mismatch indicates different content
+                let conflict = SyncConflict {
+                    path: server_path.clone(),
+                    local_modified: client_metadata.modified,
+                    remote_modified: server_metadata.modified,
+                    resolution: resolve_conflict(
+                        client_metadata,
+                        server_metadata,
+                        conflict_resolution,
+                    ),
+                };
+                
+                // Based on conflict resolution, add to appropriate operation list
+                match conflict.resolution {
+                    ConflictResolution::UseLocal => {
+                        sync_plan.client_upload.push(server_path.clone());
+                    }
+                    ConflictResolution::UseRemote => {
+                        sync_plan.client_download.push(server_path.clone());
+                    }
+                    ConflictResolution::UseNewer => {
+                        if client_metadata.modified > server_metadata.modified {
+                            sync_plan.client_upload.push(server_path.clone());
+                        } else {
+                            sync_plan.client_download.push(server_path.clone());
+                        }
+                    }
+                    ConflictResolution::Manual => {
+                        sync_plan.conflicts.push(conflict);
+                    }
+                }
+            }
+            // If hashes match, files are identical - no action needed
+        } else {
+            // File exists on server but not on client
+            if server_metadata.is_directory {
+                sync_plan.client_create_dirs.push(server_path.clone());
+            } else {
+                sync_plan.client_download.push(server_path.clone());
+            }
+        }
+    }
+    
+    // Find files that exist on client but not on server
+    for (client_path, client_metadata) in client_files {
+        if !server_files.contains_key(client_path) {
+            // File exists on client but not on server
+            // Since server is authoritative, client should delete local files that don't exist on server
+            if !client_metadata.is_directory {
+                sync_plan.client_delete.push(client_path.clone());
+            }
+        }
+    }
+    
+    Ok(sync_plan)
+}
+
+/// Resolve conflict between local and remote files based on strategy
+fn resolve_conflict(
+    _client_metadata: &FileMetadata,
+    _server_metadata: &FileMetadata,
+    strategy: &ConflictResolutionStrategy,
+) -> ConflictResolution {
+    match strategy {
+        ConflictResolutionStrategy::PreferLocal => ConflictResolution::UseLocal,
+        ConflictResolutionStrategy::PreferRemote => ConflictResolution::UseRemote,
+        ConflictResolutionStrategy::PreferNewer => ConflictResolution::UseNewer,
+        ConflictResolutionStrategy::Manual => ConflictResolution::Manual,
+    }
+}
+
+/// Simple glob-style pattern matching for file search
 fn matches_pattern(text: &str, pattern: &str) -> bool {
     // Simple implementation supporting * and ? wildcards
     if pattern == "*" {

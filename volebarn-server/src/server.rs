@@ -4,7 +4,7 @@
 //! configurable binding, error handling middleware, and health checks.
 
 use crate::{Result, ServerError};
-use crate::handlers::{AppState, upload_file, update_file, delete_file, get_file_metadata, list_directory, create_directory, delete_directory, search_files, get_file_or_directory, bulk_upload};
+use crate::handlers::{AppState, upload_file, update_file, delete_file, get_file_metadata, list_directory, create_directory, delete_directory, search_files, get_file_or_directory, bulk_upload, get_manifest, sync_with_manifest};
 use axum::{
     extract::MatchedPath,
     http::{Request, StatusCode},
@@ -146,6 +146,8 @@ impl Server {
             .route("/directories/{*path}", delete(delete_directory))
             // Bulk operation endpoints
             .route("/bulk/upload", post(bulk_upload))
+            .route("/bulk/manifest", get(get_manifest))
+            .route("/bulk/sync", post(sync_with_manifest))
             // Search endpoint
             .route("/search", get(search_files))
             // Add application state
@@ -216,6 +218,8 @@ async fn root_handler() -> impl IntoResponse {
             "files": "/files/*path",
             "directories": "/directories/*path",
             "bulk_upload": "/bulk/upload",
+            "bulk_manifest": "/bulk/manifest",
+            "bulk_sync": "/bulk/sync",
             "search": "/search"
         }
     });

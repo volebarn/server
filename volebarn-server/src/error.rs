@@ -37,6 +37,9 @@ pub enum ServerError {
     #[error("Invalid path: {path} - {reason}")]
     InvalidPath { path: String, reason: String },
 
+    #[error("Invalid request: {field} - {error}")]
+    InvalidRequest { field: String, error: String },
+
     #[error("Permission denied for {path}: {reason}")]
     PermissionDenied { path: String, reason: String },
 
@@ -100,7 +103,7 @@ impl ServerError {
             | ServerError::Io { .. }
             | ServerError::Serialization { .. }
             | ServerError::Deserialization { .. } => ErrorCode::StorageError,
-            ServerError::InvalidPath { .. } => ErrorCode::InvalidPath,
+            ServerError::InvalidPath { .. } | ServerError::InvalidRequest { .. } => ErrorCode::InvalidPath,
             ServerError::ResourceLimit { .. } => ErrorCode::ResourceLimit,
             ServerError::ConcurrentModification { .. } => ErrorCode::ConcurrentModification,
             ServerError::TlsConfig { .. } | ServerError::TlsHandshake { .. } => ErrorCode::TlsError,
