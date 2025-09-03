@@ -166,6 +166,12 @@ impl From<serde_json::Error> for ClientError {
     }
 }
 
+impl From<String> for ClientError {
+    fn from(err: String) -> Self {
+        ClientError::InvalidResponse { error: err }
+    }
+}
+
 impl Clone for ClientError {
     fn clone(&self) -> Self {
         match self {

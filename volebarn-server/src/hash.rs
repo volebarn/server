@@ -1,27 +1,32 @@
-//! Hash utilities for file integrity verification and content-addressable storage
+//! Hash utilities for file integrity verification using xxHash3
 //! 
-//! This module provides xxHash3-based hashing for fast file integrity verification
-//! and content deduplication using zero-copy operations where possible.
+//! This module provides fast hash calculation and verification using xxHash3,
+//! which is optimized for performance and suitable for content-addressable storage.
 
 use bytes::Bytes;
-use std::io::Read;
 use xxhash_rust::xxh3::xxh3_64;
 
-/// Calculate xxHash3 for bytes using zero-copy operations
-pub fn hash_bytes(data: &Bytes) -> u64 {
+/// Calculate xxHash3 for the given data
+/// 
+/// Uses xxHash3 which is extremely fast and suitable for file integrity verification.
+/// Not cryptographically secure, but perfect for detecting corruption and deduplication.
+pub fn calculate_hash(data: &[u8]) -> u64 {
     xxh3_64(data)
 }
 
-/// Calculate xxHash3 for a byte slice
-pub fn hash_slice(data: &[u8]) -> u64 {
+/// Calculate xxHash3 for Bytes (zero-copy)
+pub fn calculate_hash_bytes(data: &Bytes) -> u64 {
     xxh3_64(data)
 }
 
-/// Calculate xxHash3 for any readable stream
-pub fn hash_reader<R: Read>(mut reader: R) -> std::io::Result<u64> {
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer)?;
-    Ok(xxh3_64(&buffer))
+/// Verify that data matches the expected hash
+pub fn verify_hash(data: &[u8], expected_hash: u64) -> bool {
+    calculate_hash(data) == expected_hash
+}
+
+/// Verify that Bytes data matches the expected hash (zero-copy)
+pub fn verify_hash_bytes(data: &Bytes, expected_hash: u64) -> bool {
+    calculate_hash_bytes(data) == expected_hash
 }
 
 /// Convert hash to hex string for JSON serialization
@@ -34,12 +39,12 @@ pub fn hex_to_hash(hex: &str) -> Result<u64, std::num::ParseIntError> {
     u64::from_str_radix(hex, 16)
 }
 
-/// Verify file integrity by comparing hashes
-pub fn verify_integrity(expected: u64, actual: u64) -> bool {
-    expected == actual
+/// Alias for calculate_hash_bytes for compatibility
+pub fn hash_bytes(data: &Bytes) -> u64 {
+    calculate_hash_bytes(data)
 }
 
-/// Hash manager for coordinating hash operations
+/// Hash manager for file integrity verification
 #[derive(Debug, Clone)]
 pub struct HashManager;
 
@@ -48,31 +53,35 @@ impl HashManager {
     pub fn new() -> Self {
         Self
     }
-
-    /// Calculate hash for bytes with zero-copy
-    pub fn hash_bytes(&self, data: &Bytes) -> u64 {
-        hash_bytes(data)
+    
+    /// Calculate hash for data
+    pub fn calculate_hash(&self, data: &[u8]) -> u64 {
+        calculate_hash(data)
     }
-
-    /// Calculate hash for file content
-    pub async fn hash_file(&self, path: &std::path::Path) -> std::io::Result<u64> {
-        let content = tokio::fs::read(path).await?;
-        Ok(xxh3_64(&content))
+    
+    /// Calculate hash for Bytes
+    pub fn calculate_hash_bytes(&self, data: &Bytes) -> u64 {
+        calculate_hash_bytes(data)
     }
-
-    /// Verify file integrity
-    pub fn verify(&self, expected: u64, actual: u64) -> bool {
-        verify_integrity(expected, actual)
+    
+    /// Verify hash
+    pub fn verify_hash(&self, data: &[u8], expected_hash: u64) -> bool {
+        verify_hash(data, expected_hash)
     }
-
+    
+    /// Verify hash for Bytes
+    pub fn verify_hash_bytes(&self, data: &Bytes, expected_hash: u64) -> bool {
+        verify_hash_bytes(data, expected_hash)
+    }
+    
+    /// Verify hash and return result with error details
+    pub fn verify(&self, data: &[u8], expected_hash: u64) -> bool {
+        self.verify_hash(data, expected_hash)
+    }
+    
     /// Convert hash to hex string
     pub fn to_hex(&self, hash: u64) -> String {
         hash_to_hex(hash)
-    }
-
-    /// Parse hex string to hash
-    pub fn from_hex(&self, hex: &str) -> Result<u64, std::num::ParseIntError> {
-        hex_to_hash(hex)
     }
 }
 
@@ -87,46 +96,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hash_consistency() {
+    fn test_hash_calculation() {
         let data = b"Hello, World!";
-        let bytes = Bytes::from_static(data);
+        let hash = calculate_hash(data);
         
-        let hash1 = hash_slice(data);
-        let hash2 = hash_bytes(&bytes);
+        // Hash should be consistent
+        assert_eq!(hash, calculate_hash(data));
         
-        assert_eq!(hash1, hash2);
+        // Different data should produce different hash
+        let different_data = b"Hello, World?";
+        assert_ne!(hash, calculate_hash(different_data));
+    }
+
+    #[test]
+    fn test_hash_verification() {
+        let data = b"Test data for verification";
+        let hash = calculate_hash(data);
+        
+        assert!(verify_hash(data, hash));
+        assert!(!verify_hash(b"Different data", hash));
+    }
+
+    #[test]
+    fn test_bytes_hash() {
+        let data = Bytes::from_static(b"Test bytes data");
+        let hash = calculate_hash_bytes(&data);
+        
+        assert!(verify_hash_bytes(&data, hash));
+        
+        let different_data = Bytes::from_static(b"Different bytes");
+        assert!(!verify_hash_bytes(&different_data, hash));
     }
 
     #[test]
     fn test_hex_conversion() {
-        let hash = 0x1234567890abcdef;
+        let hash = 0x123456789abcdef0u64;
         let hex = hash_to_hex(hash);
+        assert_eq!(hex, "123456789abcdef0");
+        
         let parsed = hex_to_hash(&hex).unwrap();
-        
-        assert_eq!(hash, parsed);
-        assert_eq!(hex, "1234567890abcdef");
+        assert_eq!(parsed, hash);
     }
 
     #[test]
-    fn test_integrity_verification() {
-        let hash1 = 0x1234567890abcdef;
-        let hash2 = 0x1234567890abcdef;
-        let hash3 = 0xfedcba0987654321;
+    fn test_empty_data() {
+        let empty_data = b"";
+        let hash = calculate_hash(empty_data);
+        assert!(verify_hash(empty_data, hash));
         
-        assert!(verify_integrity(hash1, hash2));
-        assert!(!verify_integrity(hash1, hash3));
-    }
-
-    #[test]
-    fn test_hash_manager() {
-        let manager = HashManager::new();
-        let data = Bytes::from_static(b"test data");
-        
-        let hash = manager.hash_bytes(&data);
-        let hex = manager.to_hex(hash);
-        let parsed = manager.from_hex(&hex).unwrap();
-        
-        assert_eq!(hash, parsed);
-        assert!(manager.verify(hash, parsed));
+        let empty_bytes = Bytes::new();
+        let bytes_hash = calculate_hash_bytes(&empty_bytes);
+        assert!(verify_hash_bytes(&empty_bytes, bytes_hash));
     }
 }

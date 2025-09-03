@@ -1,13 +1,12 @@
 //! Shared data types for Volebarn file synchronization system
 //! 
 //! This module contains all the core data structures used throughout the system.
-//! Types support dual serialization: serde_json for API layer and bincode for storage.
+//! Types support dual serialization: serde_json for API layer and bitcode for local storage layer.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
-
 
 /// File metadata with dual serialization support
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -95,7 +94,7 @@ pub struct SyncConflict {
 }
 
 /// Conflict resolution strategies
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub enum ConflictResolution {
     /// Upload local version to server
     UseLocal,
@@ -192,7 +191,7 @@ pub struct SyncRequest {
 }
 
 /// Conflict resolution strategy for sync requests
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub enum ConflictResolutionStrategy {
     /// Local changes win (upload to server)
     PreferLocal,
@@ -460,3 +459,8 @@ impl Default for SyncResult {
         Self::new()
     }
 }
+
+// Note: Main types use JSON serialization for API layer.
+// For storage operations with bitcode, convert to storage_types first.
+
+// Note: For storage operations, use the types in storage_types.rs which support bitcode serialization

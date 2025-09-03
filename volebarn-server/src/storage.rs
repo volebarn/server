@@ -6,6 +6,8 @@
 use crate::error::{ServerError, ServerResult};
 use crate::hash::{hash_bytes, HashManager};
 use crate::types::FileMetadata;
+use crate::storage_types::StorageFileMetadata;
+use crate::serialization::{serialize_compressed, deserialize_compressed};
 use bytes::Bytes;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
@@ -23,12 +25,12 @@ const CF_HASH_INDEX: &str = "hash_index";
 const CF_MODIFIED_INDEX: &str = "modified_index";
 
 /// Directory metadata for hierarchical support
-#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 struct DirectoryMetadata {
     path: String,
     name: String,
-    created: SystemTime,
-    modified: SystemTime,
+    created: crate::time_utils::SerializableSystemTime,
+    modified: crate::time_utils::SerializableSystemTime,
     child_count: u64,
 }
 

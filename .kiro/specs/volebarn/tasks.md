@@ -27,9 +27,9 @@
   - Select optimal compression algorithm based on benchmark results for production use
   - _Requirements: Performance optimization for file transfers and storage efficiency_
 
-- [ ] 2. Implement core data models and types
+- [x] 2. Implement core data models and types
   - Create shared types for FileMetadata, DirectoryListing, SyncPlan, and BulkOperation structs
-  - Implement dual serialization: serde_json for API layer and bitcode for RocksDB storage layer (651-2,225 MB/s performance)
+  - Implement dual serialization: serde_json for API layer and bitcode for RocksDB storage layer
   - Add Snappy compression for all serialized data requiring compression (optimal speed/ratio balance)
   - Add xxhash-rust integration for file integrity verification and content-addressable storage
   - Create comprehensive custom error types using thiserror with detailed error codes and context
@@ -37,8 +37,8 @@
 
 - [x] 3. Implement server storage layer
 - [ ] 3.1 Create async RocksDB metadata storage system
-  - Implement MetadataStore struct with RocksDB for persistent metadata storage using bitcode serialization (5-42x faster than bincode)
-  - Add Snappy compression for all serialized metadata requiring compression (651-2,225 MB/s pipeline performance)
+  - Implement MetadataStore struct with RocksDB for persistent metadata storage using bitcode serialization
+  - Add Snappy compression for all serialized metadata requiring compression
   - Set up column families for files, directories, hash index, and modified time index
   - Add async methods for CRUD operations on file metadata with atomic operations
   - Implement path normalization and hierarchical directory support
@@ -93,7 +93,7 @@
 - [ ] 5.2 Create async sync and manifest endpoints
   - Implement async GET /bulk/manifest endpoint to return complete file manifest using RocksDB iteration with bitcode deserialization
   - Create async POST /bulk/sync endpoint that receives client manifest and returns sync operations
-  - Use Snappy compression for manifest data transfer (651-2,225 MB/s pipeline performance)
+  - Use Snappy compression for manifest data transfer
   - Add async sync logic where server state is authoritative using RocksDB queries for comparison
   - Implement efficient manifest generation using RocksDB column family scans with bitcode serialization
   - Write async tests for sync scenarios with server as source of truth and persistent storage
@@ -103,7 +103,7 @@
   - Implement async POST /bulk/download for concurrent multiple file retrieval using FileStorage and zero-copy Bytes
   - Create async DELETE /bulk/delete for multiple file/directory deletion using RocksDB transactions and FileStorage cleanup
   - Add async POST /files/move and POST /files/copy endpoints using RocksDB metadata operations with bitcode serialization and FileStorage
-  - Use Snappy compression for bulk operation metadata transfer (651-2,225 MB/s pipeline performance)
+  - Use Snappy compression for bulk operation metadata transfer
   - Use DashMap for temporary request-scoped state tracking during bulk operations
   - Write comprehensive async tests for all bulk operations with persistent storage and concurrent scenarios
   - _Requirements: 1.10, 1.13, 1.15, 1.16, 3.10, 3.12_

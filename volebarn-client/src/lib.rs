@@ -9,6 +9,9 @@ pub mod hash;
 pub mod config;
 pub mod retry;
 pub mod types;
+pub mod serialization;
+pub mod time_utils;
+pub mod storage_types;
 
 pub use client::Client;
 pub use error::ClientError;

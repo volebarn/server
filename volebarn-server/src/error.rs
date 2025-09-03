@@ -174,19 +174,12 @@ impl From<serde_json::Error> for ServerError {
     }
 }
 
-impl From<bincode::error::EncodeError> for ServerError {
-    fn from(err: bincode::error::EncodeError) -> Self {
-        ServerError::Serialization {
-            operation: "bincode_encode".to_string(),
-            error: err.to_string(),
-        }
-    }
-}
-
-impl From<bincode::error::DecodeError> for ServerError {
-    fn from(err: bincode::error::DecodeError) -> Self {
+impl From<bitcode::Error> for ServerError {
+    fn from(err: bitcode::Error) -> Self {
+        // bitcode::Error is a simple error type, we'll treat all as deserialization errors
+        // since bitcode::encode doesn't return a Result
         ServerError::Deserialization {
-            operation: "bincode_decode".to_string(),
+            operation: "bitcode_decode".to_string(),
             error: err.to_string(),
         }
     }
