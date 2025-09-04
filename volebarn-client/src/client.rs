@@ -1405,6 +1405,433 @@ impl Client {
         }).await
     }
 
+    // ========================================
+    // Sync Operations
+    // ========================================
+
+    /// Get complete file manifest from server with Snappy decompression
+    #[instrument(skip(self))]
+    pub async fn get_manifest(&self, path: Option<&str>) -> ClientResult<crate::types::FileManifest> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            let url = if let Some(p) = path {
+                format!("{}/bulk/manifest?path={}", self.config.server_url(), urlencoding::encode(p))
+            } else {
+                format!("{}/bulk/manifest", self.config.server_url())
+            };
+            
+            let response = self.make_request(Method::GET, &url, None).await?;
+            
+            // Get compressed manifest data
+            let compressed_data = response.bytes().await
+                .map_err(ClientError::Network)?;
+            
+            // Update download statistics
+            self.bytes_downloaded.fetch_add(compressed_data.len() as u64, Ordering::Relaxed);
+            
+            // Decompress and deserialize using Snappy + JSON
+            let decompressed_data = crate::serialization::decompress_data(&compressed_data)?;
+            let manifest: crate::types::FileManifest = crate::serialization::deserialize_json(&decompressed_data)?;
+            
+            debug!("Retrieved manifest with {} files", manifest.files.len());
+            Ok(manifest)
+        }).await
+    }
+
+    /// Compare local vs remote manifest and get sync plan using lock-free operations
+    #[instrument(skip(self, local_manifest))]
+    pub async fn sync_plan(&self, local_manifest: crate::types::FileManifest, conflict_resolution: crate::types::ConflictResolutionStrategy) -> ClientResult<crate::types::SyncPlan> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        self.retry_policy.execute(|| async {
+            // Create sync request
+            let sync_request = crate::types::SyncRequest {
+                client_manifest: local_manifest.clone(),
+                conflict_resolution: conflict_resolution.clone(),
+            };
+            
+            // Serialize and compress request using Snappy + JSON
+            let request_data = crate::serialization::serialize_json(&sync_request)?;
+            let compressed_request = crate::serialization::compress_data(&request_data)?;
+            
+            let url = format!("{}/bulk/sync", self.config.server_url());
+            let response = self.make_json_request(Method::POST, &url, Some(Bytes::from(compressed_request))).await?;
+            
+            // Get compressed response data
+            let compressed_response = response.bytes().await
+                .map_err(ClientError::Network)?;
+            
+            // Update statistics
+            self.bytes_downloaded.fetch_add(compressed_response.len() as u64, Ordering::Relaxed);
+            
+            // Decompress and deserialize using Snappy + JSON
+            let decompressed_response = crate::serialization::decompress_data(&compressed_response)?;
+            let sync_plan: crate::types::SyncPlan = crate::serialization::deserialize_json(&decompressed_response)?;
+            
+            debug!("Sync plan: {} uploads, {} downloads, {} deletes, {} conflicts", 
+                   sync_plan.client_upload.len(), 
+                   sync_plan.client_download.len(), 
+                   sync_plan.client_delete.len(), 
+                   sync_plan.conflicts.len());
+            
+            Ok(sync_plan)
+        }).await
+    }
+
+    /// Download missing files from server with atomic progress tracking
+    #[instrument(skip(self, file_paths))]
+    pub async fn download_missing_files(&self, file_paths: &[String]) -> ClientResult<Vec<(String, Bytes)>> {
+        if file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        // Use atomic counters for progress tracking
+        let _total_files = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(file_paths.len()));
+        let completed_files = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed_files = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Download files concurrently using lock-free patterns
+        let mut download_tasks = Vec::new();
+        
+        for path in file_paths {
+            let client = self.clone_for_background();
+            let path = path.clone();
+            let completed = completed_files.clone();
+            let failed = failed_files.clone();
+            
+            let task = tokio::spawn(async move {
+                match client.download_file(&path).await {
+                    Ok(content) => {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        Ok((path, content))
+                    }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        Err((path, e))
+                    }
+                }
+            });
+            
+            download_tasks.push(task);
+        }
+
+        // Collect results using lock-free operations
+        let mut successful_downloads = Vec::new();
+        let mut errors = Vec::new();
+
+        for task in download_tasks {
+            match task.await {
+                Ok(Ok((path, content))) => {
+                    successful_downloads.push((path, content));
+                }
+                Ok(Err((path, error))) => {
+                    errors.push((path, error.to_string()));
+                }
+                Err(join_error) => {
+                    errors.push(("unknown".to_string(), join_error.to_string()));
+                }
+            }
+        }
+
+        let success_count = completed_files.load(Ordering::Relaxed);
+        let error_count = failed_files.load(Ordering::Relaxed);
+        
+        debug!("Downloaded {} files successfully, {} failed", success_count, error_count);
+
+        if !errors.is_empty() {
+            return Err(ClientError::PartialFailure {
+                successful: success_count,
+                failed: error_count,
+                errors: errors.into_iter().map(|(path, error)| format!("{}: {}", path, error)).collect(),
+            });
+        }
+
+        Ok(successful_downloads)
+    }
+
+    /// Delete extra local files with atomic progress tracking
+    #[instrument(skip(self, file_paths, delete_fn))]
+    pub async fn delete_extra_local_files<F, Fut>(&self, file_paths: &[String], delete_fn: F) -> ClientResult<Vec<String>>
+    where
+        F: Fn(String) -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = Result<(), std::io::Error>> + Send + 'static,
+    {
+        if file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Use atomic counters for progress tracking
+        let _total_files = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(file_paths.len()));
+        let completed_files = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed_files = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Delete files concurrently using lock-free patterns
+        let mut delete_tasks = Vec::new();
+        
+        for path in file_paths {
+            let path = path.clone();
+            let delete_fn = delete_fn.clone();
+            let completed = completed_files.clone();
+            let failed = failed_files.clone();
+            
+            let task = tokio::spawn(async move {
+                match delete_fn(path.clone()).await {
+                    Ok(()) => {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        Ok(path)
+                    }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        Err((path, e))
+                    }
+                }
+            });
+            
+            delete_tasks.push(task);
+        }
+
+        // Collect results using lock-free operations
+        let mut successful_deletions = Vec::new();
+        let mut errors = Vec::new();
+
+        for task in delete_tasks {
+            match task.await {
+                Ok(Ok(path)) => {
+                    successful_deletions.push(path);
+                }
+                Ok(Err((path, error))) => {
+                    errors.push((path, error.to_string()));
+                }
+                Err(join_error) => {
+                    errors.push(("unknown".to_string(), join_error.to_string()));
+                }
+            }
+        }
+
+        let success_count = completed_files.load(Ordering::Relaxed);
+        let error_count = failed_files.load(Ordering::Relaxed);
+        
+        debug!("Deleted {} files successfully, {} failed", success_count, error_count);
+
+        if !errors.is_empty() {
+            return Err(ClientError::PartialFailure {
+                successful: success_count,
+                failed: error_count,
+                errors: errors.into_iter().map(|(path, error)| format!("{}: {}", path, error)).collect(),
+            });
+        }
+
+        Ok(successful_deletions)
+    }
+
+    /// High-level full sync method that makes local directory match server using lock-free patterns
+    #[instrument(skip(self, local_manifest, _upload_fn, download_fn, delete_fn, create_dir_fn))]
+    pub async fn full_sync<UF, UFut, DF, DFut, DelF, DelFut, CF, CFut>(
+        &self,
+        local_manifest: crate::types::FileManifest,
+        conflict_resolution: crate::types::ConflictResolutionStrategy,
+        _upload_fn: UF,
+        download_fn: DF,
+        delete_fn: DelF,
+        create_dir_fn: CF,
+    ) -> ClientResult<crate::types::SyncResult>
+    where
+        UF: Fn(String, Bytes) -> UFut + Send + Sync + Clone + 'static,
+        UFut: std::future::Future<Output = Result<(), std::io::Error>> + Send + 'static,
+        DF: Fn(String, Bytes) -> DFut + Send + Sync + Clone + 'static,
+        DFut: std::future::Future<Output = Result<(), std::io::Error>> + Send + 'static,
+        DelF: Fn(String) -> DelFut + Send + Sync + Clone + 'static,
+        DelFut: std::future::Future<Output = Result<(), std::io::Error>> + Send + 'static,
+        CF: Fn(String) -> CFut + Send + Sync + Clone + 'static,
+        CFut: std::future::Future<Output = Result<(), std::io::Error>> + Send + 'static,
+    {
+        let mut sync_result = crate::types::SyncResult::new();
+
+        // Step 1: Get sync plan from server
+        let sync_plan = self.sync_plan(local_manifest, conflict_resolution).await?;
+        
+        if sync_plan.is_empty() {
+            debug!("No sync operations needed");
+            return Ok(sync_result);
+        }
+
+        debug!("Executing sync plan with {} total operations", sync_plan.total_operations());
+
+        // Step 2: Create directories first (atomic operations)
+        if !sync_plan.client_create_dirs.is_empty() {
+            debug!("Creating {} directories", sync_plan.client_create_dirs.len());
+            
+            for dir_path in &sync_plan.client_create_dirs {
+                match create_dir_fn(dir_path.clone()).await {
+                    Ok(()) => {
+                        sync_result.created_dirs.push(dir_path.clone());
+                    }
+                    Err(e) => {
+                        sync_result.errors.push((dir_path.clone(), e.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Step 3: Upload files that exist locally but not on server (atomic progress tracking)
+        if !sync_plan.client_upload.is_empty() {
+            debug!("Uploading {} files to server", sync_plan.client_upload.len());
+            
+            for file_path in &sync_plan.client_upload {
+                // Read local file and upload to server
+                match tokio::fs::read(file_path).await {
+                    Ok(content) => {
+                        let content_bytes = Bytes::from(content);
+                        match self.upload_file(file_path, content_bytes).await {
+                            Ok(_) => {
+                                sync_result.uploaded.push(file_path.clone());
+                            }
+                            Err(e) => {
+                                sync_result.errors.push((file_path.clone(), e.to_string()));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        sync_result.errors.push((file_path.clone(), format!("Failed to read local file: {}", e)));
+                    }
+                }
+            }
+        }
+
+        // Step 4: Download files that exist on server but not locally (lock-free concurrent downloads)
+        if !sync_plan.client_download.is_empty() {
+            debug!("Downloading {} files from server", sync_plan.client_download.len());
+            
+            match self.download_missing_files(&sync_plan.client_download).await {
+                Ok(downloaded_files) => {
+                    // Save downloaded files locally using provided function
+                    for (file_path, content) in downloaded_files {
+                        match download_fn(file_path.clone(), content).await {
+                            Ok(()) => {
+                                sync_result.downloaded.push(file_path);
+                            }
+                            Err(e) => {
+                                sync_result.errors.push((file_path, format!("Failed to save downloaded file: {}", e)));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    sync_result.errors.push(("bulk_download".to_string(), e.to_string()));
+                }
+            }
+        }
+
+        // Step 5: Delete local files that don't exist on server (atomic progress tracking)
+        if !sync_plan.client_delete.is_empty() {
+            debug!("Deleting {} local files", sync_plan.client_delete.len());
+            
+            match self.delete_extra_local_files(&sync_plan.client_delete, delete_fn).await {
+                Ok(deleted_files) => {
+                    sync_result.deleted_local.extend(deleted_files);
+                }
+                Err(e) => {
+                    sync_result.errors.push(("bulk_delete".to_string(), e.to_string()));
+                }
+            }
+        }
+
+        // Step 6: Handle conflicts based on resolution strategy (atomic operations)
+        if !sync_plan.conflicts.is_empty() {
+            debug!("Resolving {} conflicts", sync_plan.conflicts.len());
+            
+            for conflict in &sync_plan.conflicts {
+                let resolution_result = match conflict.resolution {
+                    crate::types::ConflictResolution::UseLocal => {
+                        // Upload local version to server
+                        match tokio::fs::read(&conflict.path).await {
+                            Ok(content) => {
+                                let content_bytes = Bytes::from(content);
+                                self.upload_file(&conflict.path, content_bytes).await
+                                    .map(|_| "uploaded_local".to_string())
+                            }
+                            Err(e) => Err(ClientError::LocalFile {
+                                path: conflict.path.clone(),
+                                error: e.to_string(),
+                            })
+                        }
+                    }
+                    crate::types::ConflictResolution::UseRemote => {
+                        // Download remote version
+                        match self.download_file(&conflict.path).await {
+                            Ok(content) => {
+                                download_fn(conflict.path.clone(), content).await
+                                    .map(|_| "downloaded_remote".to_string())
+                                    .map_err(|e| ClientError::LocalFile {
+                                        path: conflict.path.clone(),
+                                        error: e.to_string(),
+                                    })
+                            }
+                            Err(e) => Err(e)
+                        }
+                    }
+                    crate::types::ConflictResolution::UseNewer => {
+                        // Use the newer version based on timestamps
+                        if conflict.local_modified > conflict.remote_modified {
+                            // Local is newer, upload it
+                            match tokio::fs::read(&conflict.path).await {
+                                Ok(content) => {
+                                    let content_bytes = Bytes::from(content);
+                                    self.upload_file(&conflict.path, content_bytes).await
+                                        .map(|_| "uploaded_newer_local".to_string())
+                                }
+                                Err(e) => Err(ClientError::LocalFile {
+                                    path: conflict.path.clone(),
+                                    error: e.to_string(),
+                                })
+                            }
+                        } else {
+                            // Remote is newer, download it
+                            match self.download_file(&conflict.path).await {
+                                Ok(content) => {
+                                    download_fn(conflict.path.clone(), content).await
+                                        .map(|_| "downloaded_newer_remote".to_string())
+                                        .map_err(|e| ClientError::LocalFile {
+                                            path: conflict.path.clone(),
+                                            error: e.to_string(),
+                                        })
+                                }
+                                Err(e) => Err(e)
+                            }
+                        }
+                    }
+                    crate::types::ConflictResolution::Manual => {
+                        // Skip manual conflicts - they need user intervention
+                        sync_result.errors.push((conflict.path.clone(), "Manual conflict resolution required".to_string()));
+                        continue;
+                    }
+                };
+
+                match resolution_result {
+                    Ok(action) => {
+                        sync_result.conflicts_resolved.push(format!("{}: {}", conflict.path, action));
+                    }
+                    Err(e) => {
+                        sync_result.errors.push((conflict.path.clone(), format!("Conflict resolution failed: {}", e)));
+                    }
+                }
+            }
+        }
+
+        let total_operations = sync_result.success_count();
+        let total_errors = sync_result.error_count();
+        
+        debug!("Sync completed: {} successful operations, {} errors", total_operations, total_errors);
+        
+        Ok(sync_result)
+    }
+
 
 }
 
@@ -1531,5 +1958,189 @@ mod tests {
         
         // Verify incorrect hash
         assert!(!client.hash_manager.verify_bytes(&test_data, hash + 1));
+    }
+
+    #[tokio::test]
+    async fn test_sync_plan_creation() {
+        use crate::types::*;
+        use std::collections::HashMap;
+        use std::time::SystemTime;
+
+        let client = Client::with_defaults("https://localhost:8080".to_string()).await.unwrap();
+        
+        // Create a test local manifest
+        let mut local_files = HashMap::new();
+        local_files.insert(
+            "test.txt".to_string(),
+            FileMetadata::new(
+                "test.txt".to_string(),
+                100,
+                SystemTime::now(),
+                12345,
+            ),
+        );
+        
+        let local_manifest = FileManifest { files: local_files };
+        
+        // Test sync plan creation (this would normally call the server)
+        // For unit testing, we're just testing the method signature and basic structure
+        let conflict_resolution = ConflictResolutionStrategy::PreferNewer;
+        
+        // This test verifies the method exists and has the correct signature
+        // In a real test environment, you would mock the server response
+        let result = client.sync_plan(local_manifest, conflict_resolution).await;
+        
+        // Since we don't have a server running, this should fail with a network error
+        assert!(result.is_err());
+        
+        // Verify it's a network-related error (not a compilation error)
+        match result.unwrap_err() {
+            ClientError::Network(_) | ClientError::Connection { .. } | ClientError::Timeout { .. } | ClientError::CircuitBreakerOpen => {
+                // Expected - no server running
+            }
+            other => panic!("Unexpected error type: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_missing_files_empty() {
+        let client = Client::with_defaults("https://localhost:8080".to_string()).await.unwrap();
+        
+        // Test with empty file list
+        let result = client.download_missing_files(&[]).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_extra_local_files_empty() {
+        let client = Client::with_defaults("https://localhost:8080".to_string()).await.unwrap();
+        
+        // Test with empty file list
+        let delete_fn = |_path: String| async move { Ok(()) };
+        let result = client.delete_extra_local_files(&[], delete_fn).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_full_sync_empty_plan() {
+        use crate::types::*;
+        use std::collections::HashMap;
+
+        let client = Client::with_defaults("https://localhost:8080".to_string()).await.unwrap();
+        
+        // Create empty local manifest
+        let local_manifest = FileManifest { files: HashMap::new() };
+        let conflict_resolution = ConflictResolutionStrategy::PreferNewer;
+        
+        // Mock functions for file operations
+        let upload_fn = |_path: String, _content: Bytes| async move { Ok(()) };
+        let download_fn = |_path: String, _content: Bytes| async move { Ok(()) };
+        let delete_fn = |_path: String| async move { Ok(()) };
+        let create_dir_fn = |_path: String| async move { Ok(()) };
+        
+        // This should fail with network error since no server is running
+        let result = client.full_sync(
+            local_manifest,
+            conflict_resolution,
+            upload_fn,
+            download_fn,
+            delete_fn,
+            create_dir_fn,
+        ).await;
+        
+        // Verify it fails with network error (expected since no server)
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ClientError::Network(_) | ClientError::Connection { .. } | ClientError::Timeout { .. } | ClientError::CircuitBreakerOpen => {
+                // Expected - no server running
+            }
+            other => panic!("Unexpected error type: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_result_helpers() {
+        use crate::types::SyncResult;
+        
+        let mut result = SyncResult::new();
+        assert!(result.is_success());
+        assert_eq!(result.success_count(), 0);
+        assert_eq!(result.error_count(), 0);
+        
+        // Add some successful operations
+        result.uploaded.push("file1.txt".to_string());
+        result.downloaded.push("file2.txt".to_string());
+        result.created_dirs.push("dir1".to_string());
+        
+        assert!(result.is_success());
+        assert_eq!(result.success_count(), 3);
+        assert_eq!(result.error_count(), 0);
+        
+        // Add an error
+        result.errors.push(("file3.txt".to_string(), "Failed to upload".to_string()));
+        
+        assert!(!result.is_success());
+        assert_eq!(result.success_count(), 3);
+        assert_eq!(result.error_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sync_plan_helpers() {
+        use crate::types::SyncPlan;
+        
+        let mut plan = SyncPlan::new();
+        assert!(plan.is_empty());
+        assert_eq!(plan.total_operations(), 0);
+        
+        // Add some operations
+        plan.client_upload.push("file1.txt".to_string());
+        plan.client_download.push("file2.txt".to_string());
+        plan.client_delete.push("file3.txt".to_string());
+        plan.client_create_dirs.push("dir1".to_string());
+        
+        assert!(!plan.is_empty());
+        assert_eq!(plan.total_operations(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_file_metadata_helpers() {
+        use crate::types::FileMetadata;
+        use std::time::SystemTime;
+        
+        let now = SystemTime::now();
+        
+        // Test file metadata creation
+        let file_meta = FileMetadata::new(
+            "documents/test.txt".to_string(),
+            1024,
+            now,
+            12345,
+        );
+        
+        assert_eq!(file_meta.path, "documents/test.txt");
+        assert_eq!(file_meta.name, "test.txt");
+        assert_eq!(file_meta.size, 1024);
+        assert!(!file_meta.is_directory);
+        assert_eq!(file_meta.xxhash3, 12345);
+        
+        // Test directory metadata creation
+        let dir_meta = FileMetadata::new_directory(
+            "documents".to_string(),
+            now,
+        );
+        
+        assert_eq!(dir_meta.path, "documents");
+        assert_eq!(dir_meta.name, "documents");
+        assert_eq!(dir_meta.size, 0);
+        assert!(dir_meta.is_directory);
+        assert_eq!(dir_meta.xxhash3, 0);
+        
+        // Test parent path
+        assert_eq!(file_meta.parent_path(), Some("documents".to_string()));
+        assert_eq!(dir_meta.parent_path(), Some("".to_string()));
+        
+        // Test directory membership
+        assert!(file_meta.is_in_directory("documents"));
+        assert!(!file_meta.is_in_directory("other"));
     }
 }
