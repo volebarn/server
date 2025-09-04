@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, Semaphore};
 use tokio::time::{interval, timeout, Instant};
 use tracing::{debug, info, warn, instrument};
+use base64::{Engine as _, engine::general_purpose};
 
 
 /// Offline operation for queuing when server is unavailable
@@ -1065,6 +1066,342 @@ impl Client {
             debug!("Search completed successfully: {} results for pattern '{}' (encoding: {}, type: {}, errors: {})", 
                    final_count, pattern, content_encoding, content_type, final_errors);
             Ok(results)
+        }).await
+    }
+
+    // ========================================
+    // Bulk Operations
+    // ========================================
+
+    /// Upload multiple files with zero-copy Bytes and lock-free operations
+    #[instrument(skip(self, files))]
+    pub async fn bulk_upload(&self, files: Vec<crate::types::FileUpload>) -> ClientResult<crate::types::BulkUploadResponse> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        // Atomic counters for progress tracking
+        let successful_count = Arc::new(AtomicU64::new(0));
+        let failed_count = Arc::new(AtomicU64::new(0));
+        let total_bytes = Arc::new(AtomicU64::new(0));
+
+        // Calculate total size for progress tracking
+        let total_size: u64 = files.iter().map(|f| f.content.len() as u64).sum();
+        total_bytes.store(total_size, Ordering::Relaxed);
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/bulk/upload", self.config.server_url());
+            
+            // Create multipart form for zero-copy upload
+            let mut form = reqwest::multipart::Form::new();
+            
+            // Add each file as a separate part with zero-copy
+            for file_upload in &files {
+                // Calculate hash for integrity verification
+                let file_hash = self.hash_manager.hash_bytes(&file_upload.content);
+                
+                let part = reqwest::multipart::Part::bytes(file_upload.content.to_vec())
+                    .file_name(file_upload.path.clone())
+                    .mime_str("application/octet-stream")
+                    .map_err(|e| ClientError::Serialization {
+                        operation: "bulk_upload".to_string(),
+                        error: format!("Failed to create multipart: {}", e),
+                    })?;
+                
+                // Add hash as metadata
+                let part = part.headers(reqwest::header::HeaderMap::from_iter([
+                    (reqwest::header::HeaderName::from_static("x-file-hash"), 
+                     reqwest::header::HeaderValue::from_str(&format!("{:016x}", file_hash))
+                        .map_err(|e| ClientError::Serialization {
+                            operation: "bulk_upload".to_string(),
+                            error: format!("Failed to create hash header: {}", e),
+                        })?)
+                ]));
+                
+                form = form.part(file_upload.path.clone(), part);
+            }
+
+            // Make request with multipart form
+            let response = timeout(
+                self.config.request_timeout(),
+                self.http_client.post(&url).multipart(form).send()
+            ).await
+            .map_err(|_| ClientError::Timeout {
+                duration: self.config.request_timeout().as_secs(),
+                operation: "bulk_upload".to_string(),
+            })?
+            .map_err(ClientError::Network)?;
+
+            if !response.status().is_success() {
+                failed_count.store(files.len() as u64, Ordering::Relaxed);
+                return Err(ClientError::Server {
+                    status: response.status().as_u16(),
+                    message: response.status().canonical_reason()
+                        .unwrap_or("Bulk upload failed").to_string(),
+                });
+            }
+
+            // Parse response
+            let bulk_response: crate::types::BulkUploadResponse = response.json().await
+                .map_err(|e| ClientError::Deserialization {
+                    operation: "bulk_upload".to_string(),
+                    error: e.to_string(),
+                })?;
+
+            // Update atomic counters
+            successful_count.store(bulk_response.success.len() as u64, Ordering::Relaxed);
+            failed_count.store(bulk_response.failed.len() as u64, Ordering::Relaxed);
+            
+            // Update bytes uploaded counter
+            let uploaded_bytes: u64 = bulk_response.success.iter()
+                .filter_map(|path| files.iter().find(|f| f.path == *path))
+                .map(|f| f.content.len() as u64)
+                .sum();
+            self.bytes_uploaded.fetch_add(uploaded_bytes, Ordering::Relaxed);
+
+            let success_count = successful_count.load(Ordering::Relaxed);
+            let error_count = failed_count.load(Ordering::Relaxed);
+            
+            debug!("Bulk upload completed: {} successful, {} failed, {} bytes", 
+                   success_count, error_count, uploaded_bytes);
+            
+            Ok(bulk_response)
+        }).await
+    }
+
+    /// Download multiple files concurrently returning individual files with atomic progress tracking
+    #[instrument(skip(self))]
+    pub async fn bulk_download(&self, paths: Vec<&str>) -> ClientResult<Vec<crate::types::FileDownload>> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        // Atomic counters for progress tracking
+        let successful_count = Arc::new(AtomicU64::new(0));
+        let failed_count = Arc::new(AtomicU64::new(0));
+        let total_bytes_downloaded = Arc::new(AtomicU64::new(0));
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/bulk/download", self.config.server_url());
+            
+            // Create request body
+            let download_request = crate::types::BulkDownloadRequest {
+                paths: paths.iter().map(|p| p.to_string()).collect(),
+            };
+            
+            let body = serde_json::to_vec(&download_request)
+                .map_err(|e| ClientError::Serialization {
+                    operation: "bulk_download".to_string(),
+                    error: e.to_string(),
+                })?;
+
+            // Make request with compression support headers
+            let mut request = self.http_client.post(&url);
+            request = request.header("Accept-Encoding", "snappy, gzip, deflate");
+            request = request.header("Accept", "application/json, application/octet-stream");
+            request = request.header("Content-Type", "application/json");
+            request = request.body(body);
+
+            let response = timeout(
+                self.config.request_timeout(),
+                request.send()
+            ).await
+            .map_err(|_| ClientError::Timeout {
+                duration: self.config.request_timeout().as_secs(),
+                operation: "bulk_download".to_string(),
+            })?
+            .map_err(ClientError::Network)?;
+
+            if !response.status().is_success() {
+                failed_count.store(paths.len() as u64, Ordering::Relaxed);
+                return Err(ClientError::Server {
+                    status: response.status().as_u16(),
+                    message: response.status().canonical_reason()
+                        .unwrap_or("Bulk download failed").to_string(),
+                });
+            }
+
+            // Check content encoding and handle accordingly
+            let content_encoding = response.headers()
+                .get("content-encoding")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            let content_type = response.headers()
+                .get("content-type")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+
+            let body_bytes = response.bytes().await
+                .map_err(ClientError::Network)?;
+
+            let downloads = if content_encoding == "snappy" && content_type.contains("application/octet-stream") {
+                // Handle Snappy compressed Bitcode data
+                use crate::serialization::deserialize_compressed;
+                use crate::storage_types::StorageBulkDownloadResponse;
+                
+                let storage_response = deserialize_compressed::<StorageBulkDownloadResponse>(&body_bytes)?;
+                
+                // Convert storage types to API types with zero-copy and atomic progress tracking
+                storage_response.files.into_iter()
+                    .map(|storage_file| {
+                        let content_bytes = Bytes::from(storage_file.content);
+                        
+                        // Verify hash integrity
+                        let calculated_hash = self.hash_manager.hash_bytes(&content_bytes);
+                        if calculated_hash != storage_file.xxhash3 {
+                            failed_count.fetch_add(1, Ordering::Relaxed);
+                            return Err(ClientError::HashMismatch {
+                                path: storage_file.path.clone(),
+                                expected: self.hash_manager.to_hex(storage_file.xxhash3),
+                                actual: self.hash_manager.to_hex(calculated_hash),
+                            });
+                        }
+                        
+                        // Update atomic counters
+                        successful_count.fetch_add(1, Ordering::Relaxed);
+                        total_bytes_downloaded.fetch_add(content_bytes.len() as u64, Ordering::Relaxed);
+                        
+                        Ok(crate::types::FileDownload {
+                            path: storage_file.path,
+                            content: content_bytes,
+                            xxhash3: storage_file.xxhash3,
+                        })
+                    })
+                    .collect::<ClientResult<Vec<_>>>()?
+            } else {
+                // Handle standard JSON response
+                let json_response: crate::types::BulkDownloadResponse = serde_json::from_slice(&body_bytes)
+                    .map_err(|e| ClientError::Deserialization {
+                        operation: "bulk_download".to_string(),
+                        error: e.to_string(),
+                    })?;
+                
+                // Convert JSON response to FileDownload with zero-copy and atomic progress tracking
+                json_response.files.into_iter()
+                    .map(|file_response| {
+                        // Decode base64 content
+                        let content = general_purpose::STANDARD.decode(&file_response.content)
+                            .map_err(|e| {
+                                failed_count.fetch_add(1, Ordering::Relaxed);
+                                ClientError::Deserialization {
+                                    operation: "bulk_download".to_string(),
+                                    error: format!("Failed to decode base64 content: {}", e),
+                                }
+                            })?;
+                        
+                        let content_bytes = Bytes::from(content);
+                        
+                        // Parse hash
+                        let xxhash3 = u64::from_str_radix(&file_response.hash, 16)
+                            .map_err(|e| {
+                                failed_count.fetch_add(1, Ordering::Relaxed);
+                                ClientError::InvalidResponse {
+                                    error: format!("Invalid hash format: {}", e),
+                                }
+                            })?;
+                        
+                        // Verify hash integrity
+                        let calculated_hash = self.hash_manager.hash_bytes(&content_bytes);
+                        if calculated_hash != xxhash3 {
+                            failed_count.fetch_add(1, Ordering::Relaxed);
+                            return Err(ClientError::HashMismatch {
+                                path: file_response.path.clone(),
+                                expected: file_response.hash,
+                                actual: self.hash_manager.to_hex(calculated_hash),
+                            });
+                        }
+                        
+                        // Update atomic counters
+                        successful_count.fetch_add(1, Ordering::Relaxed);
+                        total_bytes_downloaded.fetch_add(content_bytes.len() as u64, Ordering::Relaxed);
+                        
+                        Ok(crate::types::FileDownload {
+                            path: file_response.path,
+                            content: content_bytes,
+                            xxhash3,
+                        })
+                    })
+                    .collect::<ClientResult<Vec<_>>>()?
+            };
+
+            // Update global download statistics
+            let downloaded_bytes = total_bytes_downloaded.load(Ordering::Relaxed);
+            self.bytes_downloaded.fetch_add(downloaded_bytes, Ordering::Relaxed);
+
+            let success_count = successful_count.load(Ordering::Relaxed);
+            let error_count = failed_count.load(Ordering::Relaxed);
+            
+            debug!("Bulk download completed: {} successful, {} failed, {} bytes (encoding: {}, type: {})", 
+                   success_count, error_count, downloaded_bytes, content_encoding, content_type);
+            
+            Ok(downloads)
+        }).await
+    }
+
+    /// Delete multiple files/directories with lock-free operations
+    #[instrument(skip(self))]
+    pub async fn bulk_delete(&self, paths: Vec<&str>) -> ClientResult<crate::types::BulkDeleteResponse> {
+        let _permit = self.concurrency_limiter.acquire().await
+            .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
+
+        // Atomic counters for progress tracking
+        let successful_count = Arc::new(AtomicU64::new(0));
+        let failed_count = Arc::new(AtomicU64::new(0));
+
+        self.retry_policy.execute(|| async {
+            let url = format!("{}/bulk/delete", self.config.server_url());
+            
+            // Create request body
+            let delete_request = crate::types::BulkDeleteRequest {
+                paths: paths.iter().map(|p| p.to_string()).collect(),
+            };
+            
+            let body = serde_json::to_vec(&delete_request)
+                .map_err(|e| ClientError::Serialization {
+                    operation: "bulk_delete".to_string(),
+                    error: e.to_string(),
+                })?;
+
+            let response = timeout(
+                self.config.request_timeout(),
+                self.http_client.delete(&url)
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .send()
+            ).await
+            .map_err(|_| ClientError::Timeout {
+                duration: self.config.request_timeout().as_secs(),
+                operation: "bulk_delete".to_string(),
+            })?
+            .map_err(ClientError::Network)?;
+
+            if !response.status().is_success() {
+                failed_count.store(paths.len() as u64, Ordering::Relaxed);
+                return Err(ClientError::Server {
+                    status: response.status().as_u16(),
+                    message: response.status().canonical_reason()
+                        .unwrap_or("Bulk delete failed").to_string(),
+                });
+            }
+
+            // Parse response
+            let bulk_response: crate::types::BulkDeleteResponse = response.json().await
+                .map_err(|e| ClientError::Deserialization {
+                    operation: "bulk_delete".to_string(),
+                    error: e.to_string(),
+                })?;
+
+            // Update atomic counters
+            successful_count.store(bulk_response.success.len() as u64, Ordering::Relaxed);
+            failed_count.store(bulk_response.failed.len() as u64, Ordering::Relaxed);
+
+            let success_count = successful_count.load(Ordering::Relaxed);
+            let error_count = failed_count.load(Ordering::Relaxed);
+            
+            debug!("Bulk delete completed: {} successful, {} failed", success_count, error_count);
+            
+            Ok(bulk_response)
         }).await
     }
 

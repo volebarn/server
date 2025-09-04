@@ -151,7 +151,7 @@
   - _Requirements: 3.1, 3.13_
 
 - [ ] 9. Implement client library bulk operations
-- [ ] 9.1 Create async bulk transfer methods
+- [x] 9.1 Create async bulk transfer methods
   - Implement async bulk_upload method with zero-copy Bytes and lock-free operations
   - Create async bulk_download method returning individual files concurrently using atomic progress tracking
   - Add async bulk_delete method for lock-free multiple file deletion

@@ -47,6 +47,7 @@ notify = "8.2"
 uuid = { version = "1.18", features = ["v4"] }
 crossbeam = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
 
 # Development dependencies
 tokio-test = "0.4"

@@ -8,6 +8,7 @@ use crate::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
+use base64::{Engine as _, engine::general_purpose};
 
 /// File metadata optimized for storage with bitcode serialization
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bitcode::Encode, bitcode::Decode)]
@@ -115,6 +116,24 @@ pub enum StorageBulkOperation {
     Sync {
         plan: StorageSyncPlan,
     },
+}
+
+/// File download for bulk operations optimized for storage
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+pub struct StorageFileDownload {
+    /// File path
+    pub path: String,
+    /// File content as Vec<u8> for bitcode compatibility
+    pub content: Vec<u8>,
+    /// File integrity hash
+    pub xxhash3: u64,
+}
+
+/// Bulk download response optimized for storage
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+pub struct StorageBulkDownloadResponse {
+    /// Individual files (not archived)
+    pub files: Vec<StorageFileDownload>,
 }
 
 // Conversion implementations between API types and storage types
@@ -332,3 +351,58 @@ impl DualDeserialize for StorageSyncRequest {}
 
 impl DualSerialize for StorageBulkOperation {}
 impl DualDeserialize for StorageBulkOperation {}
+
+impl DualSerialize for StorageFileDownload {}
+impl DualDeserialize for StorageFileDownload {}
+
+impl DualSerialize for StorageBulkDownloadResponse {}
+impl DualDeserialize for StorageBulkDownloadResponse {}
+
+// Conversion implementations for new storage types
+impl From<crate::types::FileDownload> for StorageFileDownload {
+    fn from(download: crate::types::FileDownload) -> Self {
+        Self {
+            path: download.path,
+            content: download.content.to_vec(),
+            xxhash3: download.xxhash3,
+        }
+    }
+}
+
+impl From<StorageFileDownload> for crate::types::FileDownload {
+    fn from(storage: StorageFileDownload) -> Self {
+        Self {
+            path: storage.path,
+            content: bytes::Bytes::from(storage.content),
+            xxhash3: storage.xxhash3,
+        }
+    }
+}
+
+impl From<crate::types::BulkDownloadResponse> for StorageBulkDownloadResponse {
+    fn from(response: crate::types::BulkDownloadResponse) -> Self {
+        Self {
+            files: response.files.into_iter()
+                .map(|f| StorageFileDownload {
+                    path: f.path,
+                    content: base64::engine::general_purpose::STANDARD.decode(&f.content).unwrap_or_default(),
+                    xxhash3: u64::from_str_radix(&f.hash, 16).unwrap_or(0),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<StorageBulkDownloadResponse> for crate::types::BulkDownloadResponse {
+    fn from(storage: StorageBulkDownloadResponse) -> Self {
+        Self {
+            files: storage.files.into_iter()
+                .map(|f| crate::types::FileDownloadResponse {
+                    path: f.path,
+                    content: base64::engine::general_purpose::STANDARD.encode(&f.content),
+                    hash: format!("{:016x}", f.xxhash3),
+                })
+                .collect(),
+        }
+    }
+}
