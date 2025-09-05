@@ -23,6 +23,7 @@ crossbeam = { workspace = true }
 # Additional dependencies for console app
 clap = { version = "4.4", features = ["derive"] }
 dirs = "5.0"
+toml = "0.8"
 
 [dev-dependencies]
 tokio-test = { workspace = true }

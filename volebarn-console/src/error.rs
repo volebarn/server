@@ -12,4 +12,13 @@ pub enum ConsoleError {
     
     #[error("Client error: {0}")]
     Client(#[from] volebarn_client::ClientError),
+    
+    #[error("File watcher error: {0}")]
+    FileWatcher(String),
+    
+    #[error("Sync error: {0}")]
+    Sync(String),
+    
+    #[error("Index error: {0}")]
+    Index(String),
 }
