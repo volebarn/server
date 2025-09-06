@@ -19,6 +19,9 @@ tracing-subscriber = { workspace = true }
 notify = { workspace = true }
 uuid = { workspace = true }
 crossbeam = { workspace = true }
+rocksdb = { workspace = true }
+bitcode = { workspace = true }
+snap = { workspace = true }
 
 # Additional dependencies for console app
 clap = { version = "4.4", features = ["derive"] }

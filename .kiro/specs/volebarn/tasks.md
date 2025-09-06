@@ -185,7 +185,7 @@
   - _Requirements: 2.2, 2.3, 2.4, 2.5, 2.6_
 
 - [ ] 11. Implement console application file index
-- [ ] 11.1 Create async local file index with optional persistence
+- [x] 11.1 Create async local file index with optional persistence
   - Implement async FileIndex using DashMap for tracking entire directory tree state lock-free
   - Add optional local RocksDB for persisting client-side file index across restarts using bitcode serialization
   - Use Snappy compression for local index persistence 
@@ -195,7 +195,7 @@
   - Write async tests for file index operations and change detection with concurrent updates
   - _Requirements: 2.7, 2.13_
 
-- [ ] 11.2 Add async local file management
+- [x] 11.2 Add async local file management
   - Implement async LocalFileManager for local file operations using zero-copy Bytes
   - Add async methods for reading, writing, and deleting local files with lock-free state tracking
   - Include async hash calculation for local files using xxHash3 and atomic progress counters
