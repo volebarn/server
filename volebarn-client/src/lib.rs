@@ -13,6 +13,15 @@ pub mod serialization;
 pub mod time_utils;
 pub mod storage_types;
 
+// Resilience and error handling modules
+pub mod offline_queue;
+pub mod chunked_upload;
+pub mod graceful_degradation;
+pub mod metrics;
+
+#[cfg(test)]
+pub mod resilience_tests;
+
 pub use client::Client;
 pub use error::ClientError;
 pub use config::Config;

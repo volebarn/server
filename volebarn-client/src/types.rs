@@ -27,6 +27,54 @@ pub struct FileMetadata {
     pub storage_path: Option<String>,
 }
 
+/// Serializable version of FileMetadata for bitcode storage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bitcode::Encode, bitcode::Decode)]
+pub struct SerializableFileMetadata {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub modified_secs: u64, // SystemTime as seconds since epoch
+    pub is_directory: bool,
+    pub xxhash3: u64,
+    pub storage_path: Option<String>,
+}
+
+impl From<FileMetadata> for SerializableFileMetadata {
+    fn from(metadata: FileMetadata) -> Self {
+        let modified_secs = metadata.modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        Self {
+            path: metadata.path,
+            name: metadata.name,
+            size: metadata.size,
+            modified_secs,
+            is_directory: metadata.is_directory,
+            xxhash3: metadata.xxhash3,
+            storage_path: metadata.storage_path,
+        }
+    }
+}
+
+impl From<SerializableFileMetadata> for FileMetadata {
+    fn from(serializable: SerializableFileMetadata) -> Self {
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(serializable.modified_secs);
+        
+        Self {
+            path: serializable.path,
+            name: serializable.name,
+            size: serializable.size,
+            modified,
+            is_directory: serializable.is_directory,
+            xxhash3: serializable.xxhash3,
+            storage_path: serializable.storage_path,
+        }
+    }
+}
+
 /// API response version of FileMetadata with JSON-friendly types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadataResponse {

@@ -26,9 +26,15 @@ chrono = { workspace = true }
 base64 = { workspace = true }
 urlencoding = "2.1"
 
+# Resilience and monitoring dependencies
+rocksdb = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 futures = { workspace = true }
+wiremock = "0.6"

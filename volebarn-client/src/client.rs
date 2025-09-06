@@ -7,28 +7,23 @@ use crate::config::Config;
 use crate::error::{ClientError, ClientResult};
 use crate::hash::HashManager;
 use crate::retry::{RetryPolicy, HealthMonitor};
+use crate::offline_queue::{OfflineQueue, OperationType, OperationPriority};
+use crate::chunked_upload::ChunkedUploadManager;
+use crate::graceful_degradation::{GracefulDegradationManager, DegradationMode};
+use crate::metrics::{MetricsCollector, PerformanceMeasurement};
 use bytes::Bytes;
-use crossbeam::queue::SegQueue;
+
 use reqwest::{ClientBuilder, Method, Response};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::sync::{broadcast, Semaphore};
 use tokio::time::{interval, timeout, Instant};
 use tracing::{debug, info, warn, instrument};
 use base64::{Engine as _, engine::general_purpose};
 
 
-/// Offline operation for queuing when server is unavailable
-#[derive(Debug, Clone)]
-pub struct OfflineOperation {
-    pub id: String,
-    pub operation_type: String,
-    pub path: String,
-    pub data: Option<Bytes>,
-    pub timestamp: SystemTime,
-    pub retry_count: u32,
-}
+
 
 /// Client statistics for monitoring
 #[derive(Debug, Clone)]
@@ -56,8 +51,14 @@ pub struct Client {
     health_monitor: Arc<HealthMonitor>,
     /// Hash manager for integrity verification
     hash_manager: HashManager,
-    /// Lock-free offline operation queue
-    offline_queue: Arc<SegQueue<OfflineOperation>>,
+    /// Persistent offline operation queue
+    offline_queue: Arc<OfflineQueue>,
+    /// Chunked upload manager for large files
+    chunked_upload_manager: Arc<ChunkedUploadManager>,
+    /// Graceful degradation manager
+    degradation_manager: Arc<GracefulDegradationManager>,
+    /// Metrics collector
+    metrics_collector: Arc<MetricsCollector>,
     /// Maximum offline queue size
     offline_queue_max_size: Arc<AtomicU32>,
     /// Current offline queue size
@@ -95,7 +96,36 @@ impl Client {
         let retry_policy = Arc::new(RetryPolicy::new(config.clone()));
         let health_monitor = Arc::new(HealthMonitor::new(config.clone()));
         let hash_manager = HashManager::new();
-        let offline_queue = Arc::new(SegQueue::new());
+        
+        // Initialize resilience components
+        let offline_queue = Arc::new(
+            OfflineQueue::new(
+                std::env::temp_dir().join("volebarn_offline_queue"),
+                config.offline_queue_size(),
+                Duration::from_secs(30),
+            ).await?
+        );
+        
+        let chunked_upload_manager = Arc::new(
+            ChunkedUploadManager::new(
+                http_client.clone(),
+                config.server_url(),
+                config.chunk_size(),
+                config.max_concurrent(),
+                Duration::from_secs(3600),
+            )
+        );
+        
+        let degradation_manager = Arc::new(
+            GracefulDegradationManager::new(
+                std::env::temp_dir().join("volebarn_cache"),
+                10 * 1024 * 1024, // 10MB cache
+                1000,              // 1000 entries
+                Duration::from_secs(3600), // 1 hour TTL
+            ).await?
+        );
+        
+        let metrics_collector = Arc::new(MetricsCollector::new());
         let offline_queue_max_size = Arc::new(AtomicU32::new(config.offline_queue_size()));
         let offline_queue_size = Arc::new(AtomicU32::new(0));
         let concurrency_limiter = Arc::new(Semaphore::new(config.max_concurrent() as usize));
@@ -133,6 +163,9 @@ impl Client {
             health_monitor,
             hash_manager,
             offline_queue,
+            chunked_upload_manager,
+            degradation_manager,
+            metrics_collector,
             offline_queue_max_size,
             offline_queue_size,
             concurrency_limiter,
@@ -223,6 +256,9 @@ impl Client {
             health_monitor: self.health_monitor.clone(),
             hash_manager: self.hash_manager.clone(),
             offline_queue: self.offline_queue.clone(),
+            chunked_upload_manager: self.chunked_upload_manager.clone(),
+            degradation_manager: self.degradation_manager.clone(),
+            metrics_collector: self.metrics_collector.clone(),
             offline_queue_max_size: self.offline_queue_max_size.clone(),
             offline_queue_size: self.offline_queue_size.clone(),
             concurrency_limiter: self.concurrency_limiter.clone(),
@@ -320,6 +356,90 @@ impl Client {
         let start = Instant::now();
         self.health_check().await?;
         Ok(start.elapsed())
+    }
+
+    /// Upload a large file using chunked upload with resume capability
+    #[instrument(skip(self, content))]
+    pub async fn upload_large_file(&self, path: &str, content: Bytes) -> ClientResult<String> {
+        let measurement = PerformanceMeasurement::start("chunked_upload");
+        let content_clone = content.clone(); // Clone for potential offline queue
+        
+        let result = self.chunked_upload_manager
+            .upload_chunked(path, content, None)
+            .await;
+
+        match &result {
+            Ok(upload_id) => {
+                let completed = measurement.success();
+                self.metrics_collector.record_operation(completed);
+                info!("Large file upload completed: {}", upload_id);
+            }
+            Err(e) => {
+                let completed = measurement.failure(e);
+                self.metrics_collector.record_operation(completed);
+                
+                // Queue for offline processing if appropriate
+                if e.is_retryable() && self.config.offline_mode_enabled() {
+                    let _ = self.queue_offline_operation(
+                        crate::offline_queue::OperationType::Upload,
+                        path.to_string(),
+                        Some(content_clone),
+                    ).await;
+                }
+                
+                // Record failure for degradation manager
+                let _ = self.degradation_manager.record_server_failure(e).await;
+            }
+        }
+
+        result
+    }
+
+    /// Resume a chunked upload
+    pub async fn resume_upload(&self, upload_id: &str, content: Bytes) -> ClientResult<()> {
+        self.chunked_upload_manager
+            .resume_chunked_upload(upload_id, content)
+            .await
+    }
+
+    /// Get upload progress for a chunked upload
+    pub async fn get_upload_progress(&self, upload_id: &str) -> Option<crate::chunked_upload::ChunkedUploadProgress> {
+        self.chunked_upload_manager.get_progress(upload_id).await
+    }
+
+    /// Get current degradation mode
+    pub fn degradation_mode(&self) -> DegradationMode {
+        self.degradation_manager.current_mode()
+    }
+
+    /// Get cached file content (works in offline mode)
+    pub async fn get_cached_file(&self, path: &str) -> Option<Bytes> {
+        self.degradation_manager.get_cached_file(path).await
+    }
+
+    /// Get cached metadata (works in offline mode)
+    pub async fn get_cached_metadata(&self, path: &str) -> Option<crate::types::FileMetadata> {
+        self.degradation_manager.get_cached_metadata(path).await
+    }
+
+    /// Get comprehensive client metrics
+    pub async fn get_metrics(&self) -> crate::metrics::ClientMetrics {
+        self.metrics_collector.get_metrics().await
+    }
+
+    /// Export metrics in Prometheus format
+    pub async fn export_prometheus_metrics(&self) -> String {
+        self.metrics_collector.export_prometheus().await
+    }
+
+    /// Get offline queue statistics
+    pub async fn offline_queue_stats(&self) -> crate::offline_queue::OfflineQueueStats {
+        self.offline_queue.stats().await
+    }
+
+    /// Get degradation statistics
+    pub async fn degradation_stats(&self) -> crate::graceful_degradation::DegradationStats {
+        self.degradation_manager.stats().await
     }
 
     /// Get server information
@@ -463,26 +583,21 @@ impl Client {
     }
 
     /// Add operation to offline queue
-    fn queue_offline_operation(&self, operation: OfflineOperation) -> ClientResult<()> {
+    async fn queue_offline_operation(&self, operation_type: crate::offline_queue::OperationType, path: String, data: Option<Bytes>) -> ClientResult<()> {
         if !self.config.offline_mode_enabled() {
             return Err(ClientError::Connection {
                 error: "Offline mode disabled".to_string(),
             });
         }
 
-        let current_size = self.offline_queue_size.load(Ordering::Relaxed);
-        let max_size = self.offline_queue_max_size.load(Ordering::Relaxed);
+        let _operation_id = self.offline_queue.enqueue(
+            operation_type,
+            path,
+            data,
+            crate::offline_queue::OperationPriority::Normal,
+            None,
+        ).await?;
 
-        if current_size >= max_size {
-            // Try to remove an old operation to make space
-            if self.offline_queue.pop().is_some() {
-                self.offline_queue_size.fetch_sub(1, Ordering::Relaxed);
-                warn!("Offline queue full, removing oldest operation");
-            }
-        }
-
-        self.offline_queue.push(operation);
-        self.offline_queue_size.fetch_add(1, Ordering::Relaxed);
         self.offline_operations_queued.fetch_add(1, Ordering::Relaxed);
         debug!("Operation queued for offline processing");
         Ok(())
@@ -531,12 +646,12 @@ impl Client {
             return;
         }
 
-        let mut operations_to_retry = Vec::new();
+        // Operations are automatically re-queued by retry_operation method
+        // let mut operations_to_retry = Vec::new();
         let mut successful_operations = 0;
 
-        // Process operations from the lock-free queue
-        while let Some(operation) = self.offline_queue.pop() {
-            self.offline_queue_size.fetch_sub(1, Ordering::Relaxed);
+        // Process operations from the persistent queue
+        while let Some(operation) = self.offline_queue.dequeue().await.unwrap_or(None) {
 
             // Skip operations that have exceeded retry limit
             if operation.retry_count >= self.config.max_retries() {
@@ -574,22 +689,17 @@ impl Client {
             match result {
                 Ok(_) => {
                     successful_operations += 1;
+                    let _ = self.offline_queue.complete_operation(&operation.id).await;
                     self.offline_operations_queued.fetch_sub(1, Ordering::Relaxed);
                 }
                 Err(_) => {
                     // Retry the operation
-                    let mut retry_operation = operation;
-                    retry_operation.retry_count += 1;
-                    operations_to_retry.push(retry_operation);
+                    let _ = self.offline_queue.retry_operation(operation, self.config.max_retries()).await;
                 }
             }
         }
 
-        // Re-queue failed operations for retry
-        for operation in operations_to_retry {
-            self.offline_queue.push(operation);
-            self.offline_queue_size.fetch_add(1, Ordering::Relaxed);
-        }
+        // Operations are automatically re-queued by retry_operation method
 
         if successful_operations > 0 {
             info!("Processed {} offline operations successfully", successful_operations);
@@ -603,13 +713,20 @@ impl Client {
     /// Upload a file to the server with hash verification
     #[instrument(skip(self, content))]
     pub async fn upload_file(&self, path: &str, content: Bytes) -> ClientResult<crate::types::FileMetadata> {
+        // Check if operation is allowed in current degradation mode
+        if !self.degradation_manager.is_operation_allowed("upload") {
+            return Err(ClientError::Connection {
+                error: format!("Upload not allowed in {:?} mode", self.degradation_manager.current_mode()),
+            });
+        }
+
         let _permit = self.concurrency_limiter.acquire().await
             .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
 
-        // Calculate hash for integrity verification
+        let measurement = PerformanceMeasurement::start("upload_file");
         let expected_hash = self.hash_manager.hash_bytes(&content);
         
-        self.retry_policy.execute(|| async {
+        let result = self.retry_policy.execute(|| async {
             let url = format!("{}/files/{}", self.config.server_url(), path.trim_start_matches('/'));
             let response = self.make_request(Method::POST, &url, Some(content.clone())).await?;
             
@@ -632,16 +749,64 @@ impl Client {
             
             debug!("File uploaded successfully: {}", path);
             Ok(metadata)
-        }).await
+        }).await;
+
+        // Record metrics and handle failures
+        match &result {
+            Ok(metadata) => {
+                let completed = measurement.success();
+                self.metrics_collector.record_operation(completed);
+                
+                // Cache the metadata for offline access
+                let _ = self.degradation_manager.cache_metadata(path, metadata.clone()).await;
+                
+                // Record successful server contact
+                self.degradation_manager.record_server_contact().await;
+            }
+            Err(e) => {
+                let completed = measurement.failure(e);
+                self.metrics_collector.record_operation(completed);
+                
+                // Queue for offline processing if appropriate
+                if e.is_retryable() && self.config.offline_mode_enabled() {
+                    let _ = self.offline_queue.enqueue(
+                        OperationType::Upload,
+                        path.to_string(),
+                        Some(content),
+                        OperationPriority::Normal,
+                        None,
+                    ).await;
+                }
+                
+                // Record failure for degradation manager
+                let _ = self.degradation_manager.record_server_failure(e).await;
+            }
+        }
+
+        result
     }
 
     /// Download a file from the server with hash verification
     #[instrument(skip(self))]
     pub async fn download_file(&self, path: &str) -> ClientResult<Bytes> {
+        // Check if we can serve from cache in degraded modes
+        if matches!(self.degradation_manager.current_mode(), DegradationMode::Offline) {
+            if let Some(cached_content) = self.degradation_manager.get_cached_file(path).await {
+                debug!("Serving file from cache (offline mode): {}", path);
+                return Ok(cached_content);
+            } else {
+                return Err(ClientError::FileNotFound { 
+                    path: path.to_string() 
+                });
+            }
+        }
+
         let _permit = self.concurrency_limiter.acquire().await
             .map_err(|_| ClientError::Connection { error: "Concurrency limit exceeded".to_string() })?;
 
-        self.retry_policy.execute(|| async {
+        let measurement = PerformanceMeasurement::start("download_file");
+        
+        let result = self.retry_policy.execute(|| async {
             let url = format!("{}/files/{}", self.config.server_url(), path.trim_start_matches('/'));
             let response = self.make_request(Method::GET, &url, None).await?;
             
@@ -672,7 +837,38 @@ impl Client {
             
             debug!("File downloaded successfully: {}", path);
             Ok(content)
-        }).await
+        }).await;
+
+        // Record metrics and handle caching
+        match &result {
+            Ok(content) => {
+                let completed = measurement.success();
+                self.metrics_collector.record_operation(completed);
+                
+                // Cache the file for offline access
+                if let Ok(metadata) = self.get_file_metadata(path).await {
+                    let _ = self.degradation_manager.cache_file(path, content.clone(), metadata).await;
+                }
+                
+                // Record successful server contact
+                self.degradation_manager.record_server_contact().await;
+            }
+            Err(e) => {
+                let completed = measurement.failure(e);
+                self.metrics_collector.record_operation(completed);
+                
+                // Try to serve from cache as fallback
+                if let Some(cached_content) = self.degradation_manager.get_cached_file(path).await {
+                    warn!("Serving stale cached content due to download failure: {}", path);
+                    return Ok(cached_content);
+                }
+                
+                // Record failure for degradation manager
+                let _ = self.degradation_manager.record_server_failure(e).await;
+            }
+        }
+
+        result
     }
 
     /// Update an existing file on the server with hash verification
