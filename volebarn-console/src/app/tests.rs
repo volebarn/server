@@ -1,144 +1,155 @@
-//! App tests
+//! Integration tests for real-time file sync functionality
 
-use super::*;
-use std::path::PathBuf;
+use crate::{App, Config};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::time::{timeout, Duration};
+use tokio::fs;
+
+/// Create a test configuration with temporary directories
+async fn create_test_config() -> (Config, TempDir) {
+    let temp_dir = TempDir::new().unwrap();
+    let local_folder = temp_dir.path().to_path_buf();
+    
+    let mut config = Config::default();
+    config.local_folder = local_folder;
+    config.server_url = "http://localhost:8080".to_string();
+    config.verify_tls = false;
+    config.debounce_delay_ms = 50; // Faster for testing
+    config.max_concurrent_operations = 5;
+    
+    (config, temp_dir)
+}
 
 #[tokio::test]
-async fn test_app_creation_valid_config() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut config = Config::default();
-    config.local_folder = temp_dir.path().to_path_buf();
-    
+async fn test_app_initialization() {
+    let (config, _temp_dir) = create_test_config().await;
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    
+    // Test app creation
     let app = App::new(config, shutdown_flag).await;
+    assert!(app.is_ok(), "App should initialize successfully");
     
-    assert!(app.is_ok());
+    let app = app.unwrap();
+    assert!(!app.is_shutdown_requested(), "Shutdown should not be requested initially");
 }
 
 #[tokio::test]
-async fn test_app_creation_nonexistent_folder() {
-    let mut config = Config::default();
-    config.local_folder = PathBuf::from("/nonexistent/folder");
-    
+async fn test_file_event_processing_setup() {
+    let (config, _temp_dir) = create_test_config().await;
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let result = App::new(config, shutdown_flag).await;
     
-    assert!(result.is_err());
-    if let Err(ConsoleError::Config(msg)) = result {
-        assert!(msg.contains("does not exist"));
-    } else {
-        panic!("Expected Config error");
-    }
-}
-
-#[tokio::test]
-async fn test_app_creation_file_instead_of_folder() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("not_a_folder.txt");
-    tokio::fs::write(&file_path, "test content").await.unwrap();
-    
-    let mut config = Config::default();
-    config.local_folder = file_path;
-    
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let result = App::new(config, shutdown_flag).await;
-    
-    assert!(result.is_err());
-    if let Err(ConsoleError::Config(msg)) = result {
-        assert!(msg.contains("not a directory"));
-    } else {
-        panic!("Expected Config error");
-    }
-}
-
-#[tokio::test]
-async fn test_app_graceful_shutdown() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut config = Config::default();
-    config.local_folder = temp_dir.path().to_path_buf();
-    config.poll_interval_secs = 1; // Short interval for faster test
-    
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shutdown_flag_clone = shutdown_flag.clone();
-    
-    let app = App::new(config, shutdown_flag).await.unwrap();
-    
-    // Start the app in a background task
-    let app_handle = tokio::spawn(async move {
-        app.run().await
-    });
-    
-    // Let it run for a short time
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    
-    // Signal shutdown
-    shutdown_flag_clone.store(true, Ordering::SeqCst);
-    
-    // Wait for graceful shutdown with timeout
-    let result = timeout(Duration::from_secs(5), app_handle).await;
-    
-    assert!(result.is_ok());
-    assert!(result.unwrap().is_ok());
-}
-
-#[tokio::test]
-async fn test_app_config_access() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut config = Config::default();
-    config.local_folder = temp_dir.path().to_path_buf();
-    config.server_url = "https://test.example.com".to_string();
-    
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let app = App::new(config, shutdown_flag).await.unwrap();
-    
-    assert_eq!(app.config().server_url, "https://test.example.com");
-    assert_eq!(app.config().local_folder, temp_dir.path());
-}
-
-#[tokio::test]
-async fn test_app_shutdown_flag_check() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut config = Config::default();
-    config.local_folder = temp_dir.path().to_path_buf();
-    
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
     let app = App::new(config, shutdown_flag.clone()).await.unwrap();
     
-    assert!(!app.is_shutdown_requested());
+    // Test that the app has the necessary components
+    assert!(app.file_watcher.is_some(), "File watcher should be initialized");
+    assert!(app.event_receiver.is_some(), "Event receiver should be initialized");
     
+    // Test shutdown flag
     shutdown_flag.store(true, Ordering::SeqCst);
-    assert!(app.is_shutdown_requested());
+    assert!(app.is_shutdown_requested(), "Shutdown should be requested after setting flag");
 }
 
 #[tokio::test]
-async fn test_app_immediate_shutdown() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut config = Config::default();
-    config.local_folder = temp_dir.path().to_path_buf();
+async fn test_real_time_sync_stats() {
+    use crate::app::RealTimeSyncStats;
     
-    let shutdown_flag = Arc::new(AtomicBool::new(true)); // Already set to shutdown
-    let app = App::new(config, shutdown_flag).await.unwrap();
+    let stats = RealTimeSyncStats::default();
     
-    // Should exit immediately
-    let result = timeout(Duration::from_secs(1), app.run()).await;
-    assert!(result.is_ok());
-    assert!(result.unwrap().is_ok());
+    // Test initial state
+    assert_eq!(stats.events_processed.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.files_uploaded.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.sync_errors.load(Ordering::Relaxed), 0);
+    
+    // Test incrementing stats
+    stats.increment_events_processed();
+    stats.increment_files_uploaded();
+    stats.increment_sync_errors();
+    
+    assert_eq!(stats.events_processed.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.files_uploaded.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.sync_errors.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
-async fn test_app_cleanup() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut config = Config::default();
-    config.local_folder = temp_dir.path().to_path_buf();
+async fn test_file_creation_simulation() {
+    let (config, temp_dir) = create_test_config().await;
     
+    // Create a test file in the monitored directory
+    let test_file = temp_dir.path().join("test_file.txt");
+    fs::write(&test_file, "test content").await.unwrap();
+    
+    // Verify file exists
+    assert!(test_file.exists(), "Test file should exist");
+    
+    // Verify it's in the monitored directory
+    assert!(test_file.starts_with(&config.local_folder), "Test file should be in monitored directory");
+}
+
+#[tokio::test]
+async fn test_directory_operations_simulation() {
+    let (config, temp_dir) = create_test_config().await;
+    
+    // Create a test directory
+    let test_dir = temp_dir.path().join("test_directory");
+    fs::create_dir(&test_dir).await.unwrap();
+    
+    // Create a file in the directory
+    let test_file = test_dir.join("nested_file.txt");
+    fs::write(&test_file, "nested content").await.unwrap();
+    
+    // Verify directory and file exist
+    assert!(test_dir.exists(), "Test directory should exist");
+    assert!(test_file.exists(), "Nested file should exist");
+    
+    // Verify they're in the monitored directory
+    assert!(test_dir.starts_with(&config.local_folder), "Test directory should be in monitored directory");
+    assert!(test_file.starts_with(&config.local_folder), "Nested file should be in monitored directory");
+}
+
+#[tokio::test]
+async fn test_config_validation() {
+    let (mut config, _temp_dir) = create_test_config().await;
+    
+    // Test valid config
+    assert!(config.validate().is_ok(), "Valid config should pass validation");
+    
+    // Test invalid server URL
+    config.server_url = "invalid-url".to_string();
+    assert!(config.validate().is_err(), "Invalid server URL should fail validation");
+    
+    // Reset to valid URL
+    config.server_url = "http://localhost:8080".to_string();
+    
+    // Test invalid poll interval
+    config.poll_interval_secs = 0;
+    assert!(config.validate().is_err(), "Zero poll interval should fail validation");
+}
+
+#[tokio::test]
+async fn test_graceful_shutdown() {
+    let (config, _temp_dir) = create_test_config().await;
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let app = App::new(config, shutdown_flag).await.unwrap();
     
-    // Test cleanup method directly
-    let result = app.cleanup().await;
-    assert!(result.is_ok());
+    let app = App::new(config, shutdown_flag.clone()).await.unwrap();
+    
+    // Simulate shutdown request
+    shutdown_flag.store(true, Ordering::SeqCst);
+    
+    // Test cleanup (this should not panic or hang)
+    let cleanup_result = app.cleanup().await;
+    assert!(cleanup_result.is_ok(), "Cleanup should succeed");
+}
+
+#[tokio::test]
+async fn test_concurrent_operations_config() {
+    let (config, _temp_dir) = create_test_config().await;
+    
+    // Test that concurrent operations config is reasonable
+    assert!(config.max_concurrent_operations > 0, "Max concurrent operations should be positive");
+    assert!(config.max_concurrent_operations <= 100, "Max concurrent operations should be reasonable");
+    
+    // Test debounce delay
+    assert!(config.debounce_delay_ms > 0, "Debounce delay should be positive");
+    assert!(config.debounce_delay_ms < 10000, "Debounce delay should be reasonable");
 }

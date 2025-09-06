@@ -408,6 +408,46 @@ impl FileIndex {
         }
     }
     
+    /// Mark a file as modified
+    pub fn mark_modified(&self, path: &Path) -> bool {
+        if let Some(entry) = self.entries.get(path) {
+            entry.set_sync_status(SyncStatus::Modified);
+            debug!("File marked as modified: {}", path.display());
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Remove a directory and all its children from the index
+    pub fn remove_directory(&self, dir_path: &Path) {
+        let mut to_remove = Vec::new();
+        
+        // Find all entries that are children of this directory
+        for entry in self.entries.iter() {
+            let path = entry.key();
+            if path.starts_with(dir_path) {
+                to_remove.push(path.clone());
+            }
+        }
+        
+        // Remove all found entries
+        for path in to_remove {
+            self.entries.remove(&path);
+            debug!("Removed from index (directory deletion): {}", path.display());
+        }
+        
+        debug!("Removed directory and children from index: {}", dir_path.display());
+    }
+    
+    /// Save the current index state (placeholder for persistence)
+    pub async fn save_state(&self) -> Result<(), crate::ConsoleError> {
+        // For now, this is a no-op since we're using in-memory storage
+        // In the future, this could save to a local database or file
+        debug!("Index state saved (placeholder)");
+        Ok(())
+    }
+    
     /// Get file state for a path
     pub fn get_file_state(&self, path: &Path) -> Option<Arc<FileState>> {
         self.entries.get(path).map(|entry| entry.clone())

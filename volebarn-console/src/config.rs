@@ -38,6 +38,30 @@ pub struct Config {
     
     /// Log level (trace, debug, info, warn, error)
     pub log_level: String,
+    
+    /// Maximum concurrent operations for sync
+    pub max_concurrent_operations: usize,
+    
+    /// Debounce delay for file watcher in milliseconds
+    pub debounce_delay_ms: u64,
+    
+    /// Maximum event queue size for file watcher
+    pub max_event_queue_size: usize,
+    
+    /// File patterns to ignore during watching
+    pub ignore_patterns: Vec<String>,
+    
+    /// Whether to watch hidden files and directories
+    pub watch_hidden_files: bool,
+    
+    /// Periodic sync interval in seconds (fallback mechanism)
+    pub periodic_sync_interval_secs: u64,
+    
+    /// Maximum retries for client operations
+    pub max_retries: u32,
+    
+    /// Retry delay in milliseconds for client operations
+    pub retry_delay_ms: u64,
 }
 
 impl Default for Config {
@@ -53,6 +77,25 @@ impl Default for Config {
             request_timeout_secs: 60,
             verify_tls: true,
             log_level: "info".to_string(),
+            max_concurrent_operations: 10,
+            debounce_delay_ms: 100,
+            max_event_queue_size: 10000,
+            ignore_patterns: vec![
+                "*.tmp".to_string(),
+                "*.swp".to_string(),
+                "*.swo".to_string(),
+                "*~".to_string(),
+                ".DS_Store".to_string(),
+                "Thumbs.db".to_string(),
+                ".git/*".to_string(),
+                ".svn/*".to_string(),
+                "node_modules/*".to_string(),
+                "target/*".to_string(),
+            ],
+            watch_hidden_files: false,
+            periodic_sync_interval_secs: 300, // 5 minutes
+            max_retries: 3,
+            retry_delay_ms: 1000,
         }
     }
 }
@@ -206,7 +249,7 @@ impl Config {
     }
     
     /// Validate configuration values
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         // Validate server URL
         if self.server_url.is_empty() {
             return Err(ConsoleError::Config("Server URL cannot be empty".to_string()));
@@ -309,6 +352,19 @@ impl Config {
             .map_err(|e| ConsoleError::Config(format!("Failed to write config file '{}': {}", path, e)))?;
         
         Ok(())
+    }
+    
+    /// Get file index configuration
+    pub fn file_index_config(&self) -> crate::FileIndexConfig {
+        crate::FileIndexConfig {
+            persistence_path: None, // For now, use in-memory only
+            enable_compression: true,
+        }
+    }
+    
+    /// Get default conflict resolution strategy
+    pub fn default_conflict_resolution(&self) -> volebarn_client::types::ConflictResolutionStrategy {
+        volebarn_client::types::ConflictResolutionStrategy::PreferLocal
     }
 }
 

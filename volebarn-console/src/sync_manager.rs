@@ -919,7 +919,7 @@ impl SyncManager {
 
     /// Upload a single file to server
     #[instrument(skip(self))]
-    async fn upload_single_file(&self, file_path: &str) -> Result<(), ConsoleError> {
+    pub async fn upload_single_file(&self, file_path: &str) -> Result<(), ConsoleError> {
         let content = self.local_file_manager.read_file(file_path).await?;
         self.client.upload_file(file_path, content).await?;
         
@@ -928,6 +928,30 @@ impl SyncManager {
         self.file_index.mark_synced(&path);
         
         debug!("Uploaded single file: {}", file_path);
+        Ok(())
+    }
+    
+    /// Delete a single file from server
+    #[instrument(skip(self))]
+    pub async fn delete_single_file(&self, file_path: &str) -> Result<(), ConsoleError> {
+        self.client.delete_file(file_path).await?;
+        debug!("Deleted single file from server: {}", file_path);
+        Ok(())
+    }
+    
+    /// Create a directory on server
+    #[instrument(skip(self))]
+    pub async fn create_directory_on_server(&self, dir_path: &str) -> Result<(), ConsoleError> {
+        self.client.create_directory(dir_path).await?;
+        debug!("Created directory on server: {}", dir_path);
+        Ok(())
+    }
+    
+    /// Delete a directory from server
+    #[instrument(skip(self))]
+    pub async fn delete_directory_on_server(&self, dir_path: &str) -> Result<(), ConsoleError> {
+        self.client.delete_directory(dir_path).await?;
+        debug!("Deleted directory from server: {}", dir_path);
         Ok(())
     }
 

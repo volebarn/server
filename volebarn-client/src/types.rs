@@ -448,6 +448,11 @@ impl SyncResult {
         self.conflicts_resolved.len()
     }
     
+    /// Check if any changes were made during sync
+    pub fn has_changes(&self) -> bool {
+        self.success_count() > 0
+    }
+    
     /// Get total number of failed operations
     pub fn error_count(&self) -> usize {
         self.errors.len()
