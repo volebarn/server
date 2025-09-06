@@ -156,6 +156,7 @@ impl Default for FileIndexConfig {
 }
 
 /// Lock-free file index for tracking directory tree state
+#[derive(Debug)]
 pub struct FileIndex {
     /// In-memory index using DashMap for lock-free access
     entries: DashMap<PathBuf, Arc<FileState>>,

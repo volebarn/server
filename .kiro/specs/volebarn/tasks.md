@@ -184,7 +184,7 @@
   - Write async tests for file system event detection with zero-lock concurrent events
   - _Requirements: 2.2, 2.3, 2.4, 2.5, 2.6_
 
-- [ ] 11. Implement console application file index
+- [x] 11. Implement console application file index
 - [x] 11.1 Create async local file index with optional persistence
   - Implement async FileIndex using DashMap for tracking entire directory tree state lock-free
   - Add optional local RocksDB for persisting client-side file index across restarts using bitcode serialization
@@ -204,7 +204,7 @@
   - _Requirements: 2.13, 3.14_
 
 - [ ] 12. Implement console application sync logic
-- [ ] 12.1 Create async sync manager
+- [x] 12.1 Create async sync manager
   - Implement async SyncManager for coordinating sync operations using lock-free patterns
   - Add async logic where sync means "make local match remote" using atomic state tracking
   - Create async methods for downloading files from server that are missing locally with zero-copy
@@ -213,7 +213,7 @@
   - Write async tests for sync manager operations with zero-lock concurrent sync scenarios
   - _Requirements: 2.8, 2.9, 2.10, 2.11_
 
-- [ ] 12.2 Add async local file upload handling
+- [x] 12.2 Add async local file upload handling
   - Implement async detection of local files that don't exist on server using lock-free comparison
   - Add async automatic upload of new local files to server during sync with zero-copy Bytes
   - Create async handling for locally modified files using atomic change detection

@@ -17,6 +17,7 @@ pub use config::Config;
 pub use error::ConsoleError;
 pub use file_index::{FileIndex, FileIndexConfig, FileState, SyncStatus, IndexStats};
 pub use local_file_manager::{LocalFileManager, LocalFileStats, OperationProgress};
+pub use sync_manager::{SyncManager, SyncProgress, SyncProgressSnapshot};
 
 /// Console result type
 pub type Result<T> = std::result::Result<T, ConsoleError>;
